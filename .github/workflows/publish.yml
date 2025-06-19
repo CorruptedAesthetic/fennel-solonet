@@ -463,7 +463,7 @@ jobs:
           echo "✅ Extracted image tag: ${SHA_TAG}"
 
       - name: Update base values.yaml
-        uses: fjogeleit/yaml-update-action@v0.13.2
+        uses: fjogeleit/yaml-update-action@v0.16.1
         with:
           valueFile: 'Charts/fennel-node/values.yaml'
           propertyPath: 'image.tag'
@@ -471,7 +471,7 @@ jobs:
           commitChange: false
 
       - name: Update staging values.yaml
-        uses: fjogeleit/yaml-update-action@v0.13.2
+        uses: fjogeleit/yaml-update-action@v0.16.1
         with:
           valueFile: 'Charts/fennel-node/values-staging.yaml'
           propertyPath: 'image.tag'
