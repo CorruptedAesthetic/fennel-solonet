@@ -117,6 +117,7 @@ Thumbs.db
 
 # GPG and signing artifacts
 *.asc
+!.github/release-signing.pub.asc  # Exception: public key needed for CI verification
 *.gpg
 *.sig
 .gnupg/
@@ -161,7 +162,6 @@ rustfmt.toml.bak
 
 # Project-specific files to ignore
 docs/ENHANCED-CICD.md
-.github/release-signing.pub.asc
 docs/CRYPTOGRAPHIC-VERSION-UNITY.md
 scripts/init.sh
 scripts/local-k3d-setup.sh
