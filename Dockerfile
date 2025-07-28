@@ -105,11 +105,12 @@ ENV CARGO_INCREMENTAL=0
 ENV CARGO_PROFILE_RELEASE_CODEGEN_UNITS=1
 ENV CARGO_PROFILE_RELEASE_LTO=true
 
-# Add the target for cross-compilation - ensure we use the correct toolchain
+# The xbuilder image already has the aarch64 toolchain configured
+# Just switch to it and verify the target is available
 RUN rustup show && \
-    rustup toolchain list && \
-    rustup target add $TARGET --toolchain stable && \
-    rustup target list --installed
+    rustup default stable-aarch64-unknown-linux-gnu && \
+    rustup target list --installed && \
+    rustup show
 
 # Install cargo-chef for dependency caching (copy from base to avoid reinstall)
 COPY --from=base /usr/local/cargo/bin/cargo-chef /usr/local/cargo/bin/cargo-chef
