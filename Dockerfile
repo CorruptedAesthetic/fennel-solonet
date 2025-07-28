@@ -19,6 +19,11 @@ FROM base AS planner
 COPY . .
 RUN cargo chef prepare --recipe-path recipe.json
 
+# Cook dependencies on x86_64 (works for both architectures)
+FROM base AS cook
+COPY --from=planner /fennel/recipe.json recipe.json
+RUN cargo chef cook --release --recipe-path recipe.json
+
 # --- New stage: deterministic WASM runtime build using srtool -----------------
 FROM docker.io/paritytech/srtool:1.84.1 AS srtool
 
@@ -65,10 +70,10 @@ ENV VAL2_STASH_SS58=${VAL2_STASH_SS58}
 RUN rustup target add $TARGET
 
 # cargo-chef is already available from base stage (no need to copy)
+COPY --from=cook /fennel/target target
 COPY --from=planner /fennel/recipe.json recipe.json
 
-# Build dependencies first (this layer will be cached)
-RUN cargo chef cook --release --recipe-path recipe.json
+# Dependencies are already cooked, skip the cook step
 
 # Now copy the actual source code and build
 COPY . .
@@ -115,8 +120,9 @@ RUN rustup show && \
 # Install cargo-chef for dependency caching (copy from base to avoid reinstall)
 COPY --from=base /usr/local/cargo/bin/cargo-chef /usr/local/cargo/bin/cargo-chef
 
+# Copy pre-cooked dependencies from cook stage (avoids ARM64 emulation issues)
+COPY --from=cook /fennel/target target
 COPY --from=planner /fennel/recipe.json recipe.json
-RUN cargo chef cook --release --recipe-path recipe.json
 COPY . .
 RUN cargo build --locked --release --target $TARGET
 
