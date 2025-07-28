@@ -25,6 +25,9 @@ COPY --from=planner /fennel/recipe.json recipe.json
 RUN cargo chef cook --release --recipe-path recipe.json
 
 # Cook ARM64 dependencies using Parity's xbuilder (zero-setup ARM64 environment)
+# Pin to specific version for production stability instead of :latest
+# Note: Parity uses SHA+date versioning (e.g., a1b2c3d4-20250728)
+# TODO: Pin to specific version once build succeeds with :latest
 FROM --platform=$BUILDPLATFORM paritytech/xbuilder-aarch64-unknown-linux-gnu:latest AS cook-arm64
 
 # Use xbuilder's expected working directory
@@ -94,6 +97,9 @@ COPY . .
 RUN cargo build --locked --release --target $TARGET
 
 ######################## arm64 builder ####################
+# Pin to specific version for production stability instead of :latest
+# Note: Parity uses SHA+date versioning (e.g., a1b2c3d4-20250728)
+# TODO: Pin to specific version once build succeeds with :latest
 FROM --platform=$BUILDPLATFORM paritytech/xbuilder-aarch64-unknown-linux-gnu:latest AS builder-arm64
 
 # Production environment variables (passed from build args)
