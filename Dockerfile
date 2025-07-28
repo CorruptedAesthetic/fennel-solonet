@@ -117,9 +117,20 @@ RUN cargo build --locked --release --target $TARGET
 FROM docker.io/parity/base-bin:latest
 
 ARG TARGETARCH
-# Copy only the matching binary using canonical Docker pattern  
-# This avoids duplicate binaries and reduces image size by ~18MB
-COPY --from=builder-${TARGETARCH} /fennel/target/*/release/fennel-node /usr/local/bin/fennel-node
+# Copy both binaries using the battle-tested Pattern A approach
+# This avoids variable substitution in --from= which Docker doesn't support
+COPY --from=builder-amd64 /fennel/target/x86_64-unknown-linux-gnu/release/fennel-node /tmp/fennel-node-amd64
+COPY --from=builder-arm64 /fennel/target/aarch64-unknown-linux-gnu/release/fennel-node /tmp/fennel-node-arm64
+
+# Select the correct binary at runtime based on TARGETARCH
+RUN if [ "$TARGETARCH" = "amd64" ]; then \
+        mv /tmp/fennel-node-amd64 /usr/local/bin/fennel-node; \
+    elif [ "$TARGETARCH" = "arm64" ]; then \
+        mv /tmp/fennel-node-arm64 /usr/local/bin/fennel-node; \
+    else \
+        echo "Unsupported architecture: $TARGETARCH" && exit 1; \
+    fi && \
+    chmod +x /usr/local/bin/fennel-node
 
 # Copy the deterministic wasm compiled with srtool (optional but convenient for
 # governance upgrades & CI verification)
