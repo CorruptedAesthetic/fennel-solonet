@@ -24,43 +24,17 @@ FROM base AS cook
 COPY --from=planner /fennel/recipe.json recipe.json
 RUN cargo chef cook --release --recipe-path recipe.json
 
-# Cook ARM64 dependencies using consistent base with cross-compilation
-FROM base AS cook-arm64
+# Cook ARM64 dependencies using Parity's xbuilder (zero-setup ARM64 environment)
+FROM --platform=$BUILDPLATFORM paritytech/xbuilder-aarch64-unknown-linux-gnu:latest AS cook-arm64
 WORKDIR /fennel
 
-# Production environment variables (passed from build args)
-ARG SUDO_SS58
-ARG VAL1_AURA_PUB
-ARG VAL1_GRANDPA_PUB
-ARG VAL1_STASH_SS58
-ARG VAL2_AURA_PUB
-ARG VAL2_GRANDPA_PUB
-ARG VAL2_STASH_SS58
-
-# Export as environment variables for cargo build
-ENV SUDO_SS58=${SUDO_SS58}
-ENV VAL1_AURA_PUB=${VAL1_AURA_PUB}
-ENV VAL1_GRANDPA_PUB=${VAL1_GRANDPA_PUB}
-ENV VAL1_STASH_SS58=${VAL1_STASH_SS58}
-ENV VAL2_AURA_PUB=${VAL2_AURA_PUB}
-ENV VAL2_GRANDPA_PUB=${VAL2_GRANDPA_PUB}
-ENV VAL2_STASH_SS58=${VAL2_STASH_SS58}
-
-# Install ARM64 cross-compilation tools (following Parity's xbuilder pattern)
-RUN apt update && apt install -y \
-    g++-aarch64-linux-gnu libc6-dev-arm64-cross \
-    && apt clean && rm -rf /var/lib/apt/lists/*
-
-# Add ARM64 target (Parity's exact pattern)
+# Add ARM64 target to the xbuilder toolchain (one-line setup)
 RUN rustup target add aarch64-unknown-linux-gnu
 
-# Set up cross-compilation environment (from Parity's xbuilder)
-ENV CC_aarch64_unknown_linux_gnu="aarch64-linux-gnu-gcc" \
-    CXX_aarch64_unknown_linux_gnu="aarch64-linux-gnu-g++" \
-    BINDGEN_EXTRA_CLANG_ARGS="-I/usr/aarch64-linux-gnu/include/" \
-    CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_LINKER="aarch64-linux-gnu-gcc"
+# Install cargo-chef for dependency optimization
+RUN cargo install cargo-chef
 
-# Install cargo-chef (already available from base stage)
+# Cook ARM64 dependencies
 COPY --from=planner /fennel/recipe.json recipe.json
 RUN cargo chef cook --release --recipe-path recipe.json --target aarch64-unknown-linux-gnu
 
@@ -142,10 +116,14 @@ ENV VAL2_STASH_SS58=${VAL2_STASH_SS58}
 
 WORKDIR /fennel
 
-# Add ARM64 target to the xbuilder toolchain
+# Add ARM64 target to the xbuilder toolchain (zero-setup, as advertised)
 RUN rustup target add aarch64-unknown-linux-gnu
 
-# Copy sources and build exactly once - no need for target management
+# Copy pre-cooked ARM64 dependencies for faster builds
+COPY --from=cook-arm64 /fennel/target target
+COPY --from=planner /fennel/recipe.json recipe.json
+
+# Copy sources and build with pre-cooked dependencies
 COPY . .
 RUN cargo build --locked --release --target aarch64-unknown-linux-gnu
 
