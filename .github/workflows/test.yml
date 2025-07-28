@@ -56,10 +56,10 @@ jobs:
         uses: docker/build-push-action@v6
         with:
           context: .
-          target: builder   # compile code but stop before final fat image
+          target: builder-amd64   # Use the actual amd64 builder stage name
           push: false
           load: false       # don't export layers to docker engine (saves disk)
           cache-from: type=gha
 
       - name: Verify node binary exists in builder stage output
-        run: echo "Dockerfile syntax & builder stage compilation succeeded."
+        run: echo "Dockerfile syntax & builder-amd64 stage compilation succeeded."

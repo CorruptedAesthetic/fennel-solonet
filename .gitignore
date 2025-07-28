@@ -181,3 +181,4 @@ create-release-tag.sh
 PRODUCTION_SECRETS_SETUP.md
 RELEASE_PROCESS.md
 test-bootnode-injection.sh
+dockerfiles/
