@@ -133,7 +133,7 @@ COPY --from=planner /fennel/recipe.json recipe.json
 
 # Copy sources and build with xbuilder's pre-configured environment
 COPY . .
-RUN cargo +stable build --locked --release --target aarch64-unknown-linux-gnu
+RUN cargo build --locked --release --target aarch64-unknown-linux-gnu
 
 ######################## final stage #######################
 FROM docker.io/parity/base-bin:latest
