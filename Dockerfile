@@ -24,8 +24,8 @@ FROM base AS cook
 COPY --from=planner /fennel/recipe.json recipe.json
 RUN cargo chef cook --release --recipe-path recipe.json
 
-# Cook ARM64 dependencies using Parity's native ARM64 environment
-FROM docker.io/paritytech/xbuilder-aarch64-unknown-linux-gnu:latest AS cook-arm64
+# Cook ARM64 dependencies using consistent base with cross-compilation
+FROM base AS cook-arm64
 WORKDIR /fennel
 
 # Production environment variables (passed from build args)
@@ -46,14 +46,22 @@ ENV VAL2_AURA_PUB=${VAL2_AURA_PUB}
 ENV VAL2_GRANDPA_PUB=${VAL2_GRANDPA_PUB}
 ENV VAL2_STASH_SS58=${VAL2_STASH_SS58}
 
-# Optimize cargo for space and reduce compilation units
-ENV CARGO_NET_GIT_FETCH_WITH_CLI=true
-ENV CARGO_INCREMENTAL=0
-ENV CARGO_PROFILE_RELEASE_CODEGEN_UNITS=1
-ENV CARGO_PROFILE_RELEASE_LTO=true
+# Install ARM64 cross-compilation tools (following Parity's xbuilder pattern)
+RUN apt update && apt install -y \
+    g++-aarch64-linux-gnu libc6-dev-arm64-cross \
+    && apt clean && rm -rf /var/lib/apt/lists/*
 
-# Install cargo-chef in the ARM64 environment
-RUN cargo install cargo-chef
+# Add ARM64 target and toolchain (Parity's exact pattern)
+RUN rustup target add aarch64-unknown-linux-gnu && \
+    rustup toolchain install stable-aarch64-unknown-linux-gnu
+
+# Set up cross-compilation environment (from Parity's xbuilder)
+ENV CC_aarch64_unknown_linux_gnu="aarch64-linux-gnu-gcc" \
+    CXX_aarch64_unknown_linux_gnu="aarch64-linux-gnu-g++" \
+    BINDGEN_EXTRA_CLANG_ARGS="-I/usr/aarch64-linux-gnu/include/" \
+    CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_LINKER="aarch64-linux-gnu-gcc"
+
+# Install cargo-chef (already available from base stage)
 COPY --from=planner /fennel/recipe.json recipe.json
 RUN cargo chef cook --release --recipe-path recipe.json --target aarch64-unknown-linux-gnu
 
@@ -113,8 +121,7 @@ COPY . .
 RUN cargo build --locked --release --target $TARGET
 
 ######################## arm64 builder ####################
-FROM docker.io/paritytech/xbuilder-aarch64-unknown-linux-gnu:latest AS builder-arm64
-# image already has the linker + env-vars configured
+FROM base AS builder-arm64
 ARG TARGET=aarch64-unknown-linux-gnu
 
 # Production environment variables (passed from build args)
@@ -137,17 +144,22 @@ ENV VAL2_STASH_SS58=${VAL2_STASH_SS58}
 
 WORKDIR /fennel
 
-# Optimize cargo for space and reduce compilation units (same as base)
-ENV CARGO_NET_GIT_FETCH_WITH_CLI=true
-ENV CARGO_INCREMENTAL=0
-ENV CARGO_PROFILE_RELEASE_CODEGEN_UNITS=1
-ENV CARGO_PROFILE_RELEASE_LTO=true
+# Install ARM64 cross-compilation tools (following Parity's xbuilder pattern)
+RUN apt update && apt install -y \
+    g++-aarch64-linux-gnu libc6-dev-arm64-cross \
+    && apt clean && rm -rf /var/lib/apt/lists/*
 
-# Explicitly add the ARM64 target (defensive programming)
-RUN rustup target add $TARGET
+# Add ARM64 target and toolchain (Parity's exact pattern)
+RUN rustup target add $TARGET && \
+    rustup toolchain install stable-aarch64-unknown-linux-gnu
 
-# Use Parity's native ARM64 environment - no toolchain switching needed
-# Copy pre-cooked ARM64 dependencies from native ARM64 cook stage
+# Set up cross-compilation environment (from Parity's xbuilder)
+ENV CC_aarch64_unknown_linux_gnu="aarch64-linux-gnu-gcc" \
+    CXX_aarch64_unknown_linux_gnu="aarch64-linux-gnu-g++" \
+    BINDGEN_EXTRA_CLANG_ARGS="-I/usr/aarch64-linux-gnu/include/" \
+    CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_LINKER="aarch64-linux-gnu-gcc"
+
+# Use consistent toolchain - copy pre-cooked ARM64 dependencies from consistent cook stage
 COPY --from=cook-arm64 /fennel/target target
 COPY --from=planner /fennel/recipe.json recipe.json
 COPY . .
