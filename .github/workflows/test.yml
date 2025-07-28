@@ -36,12 +36,12 @@ jobs:
 
       - name: Test Build
         run: |
-          SKIP_WASM_BUILD=1 cargo test --release
+          SKIP_WASM_BUILD=1 cargo test --locked --release
 
       - name: Test Build for Benchmarking
         run: >
           pushd node &&
-          cargo test --features=runtime-benchmarks --release
+          cargo test --locked --features=runtime-benchmarks --release
 
   test-docker:
     runs-on: ubuntu-latest

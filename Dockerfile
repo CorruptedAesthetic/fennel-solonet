@@ -1,4 +1,6 @@
-FROM docker.io/paritytech/ci-unified:latest as base
+# syntax=docker/dockerfile:1.7
+######################## common base ########################
+FROM --platform=$BUILDPLATFORM docker.io/paritytech/ci-unified:latest as base
 
 WORKDIR /fennel
 
@@ -16,11 +18,6 @@ ENV CARGO_PROFILE_RELEASE_LTO=true
 FROM base AS planner
 COPY . .
 RUN cargo chef prepare --recipe-path recipe.json
-
-# Testing stage - run tests before building
-FROM base AS tester
-COPY . .
-RUN cargo test --features=runtime-benchmarks
 
 # --- New stage: deterministic WASM runtime build using srtool -----------------
 FROM docker.io/paritytech/srtool:1.84.1 AS srtool
@@ -43,8 +40,31 @@ RUN /srtool/build
 # The compact deterministic wasm will be available below.
 ENV DETERMINISTIC_WASM_PATH=target/srtool/release/wbuild/fennel-node-runtime/fennel_node_runtime.compact.wasm
 
-# Builder stage - build with cached dependencies
-FROM base AS builder
+######################## x86_64 builder ####################
+FROM base AS builder-amd64
+ARG TARGET=x86_64-unknown-linux-gnu
+
+# Production environment variables (passed from build args)
+ARG SUDO_SS58
+ARG VAL1_AURA_PUB
+ARG VAL1_GRANDPA_PUB
+ARG VAL1_STASH_SS58
+ARG VAL2_AURA_PUB
+ARG VAL2_GRANDPA_PUB
+ARG VAL2_STASH_SS58
+
+# Export as environment variables for cargo build
+ENV SUDO_SS58=${SUDO_SS58}
+ENV VAL1_AURA_PUB=${VAL1_AURA_PUB}
+ENV VAL1_GRANDPA_PUB=${VAL1_GRANDPA_PUB}
+ENV VAL1_STASH_SS58=${VAL1_STASH_SS58}
+ENV VAL2_AURA_PUB=${VAL2_AURA_PUB}
+ENV VAL2_GRANDPA_PUB=${VAL2_GRANDPA_PUB}
+ENV VAL2_STASH_SS58=${VAL2_STASH_SS58}
+
+RUN rustup target add $TARGET
+
+# cargo-chef is already available from base stage (no need to copy)
 COPY --from=planner /fennel/recipe.json recipe.json
 
 # Build dependencies first (this layer will be cached)
@@ -52,13 +72,54 @@ RUN cargo chef cook --release --recipe-path recipe.json
 
 # Now copy the actual source code and build
 COPY . .
-RUN cargo build --locked --release
+RUN cargo build --locked --release --target $TARGET
 
-# Runtime stage - final image with minimal components
+######################## arm64 builder ####################
+FROM docker.io/paritytech/xbuilder-aarch64-unknown-linux-gnu:latest AS builder-arm64
+# image already has the linker + env-vars configured
+ARG TARGET=aarch64-unknown-linux-gnu
+
+# Production environment variables (passed from build args)
+ARG SUDO_SS58
+ARG VAL1_AURA_PUB
+ARG VAL1_GRANDPA_PUB
+ARG VAL1_STASH_SS58
+ARG VAL2_AURA_PUB
+ARG VAL2_GRANDPA_PUB
+ARG VAL2_STASH_SS58
+
+# Export as environment variables for cargo build
+ENV SUDO_SS58=${SUDO_SS58}
+ENV VAL1_AURA_PUB=${VAL1_AURA_PUB}
+ENV VAL1_GRANDPA_PUB=${VAL1_GRANDPA_PUB}
+ENV VAL1_STASH_SS58=${VAL1_STASH_SS58}
+ENV VAL2_AURA_PUB=${VAL2_AURA_PUB}
+ENV VAL2_GRANDPA_PUB=${VAL2_GRANDPA_PUB}
+ENV VAL2_STASH_SS58=${VAL2_STASH_SS58}
+
+WORKDIR /fennel
+
+# Optimize cargo for space and reduce compilation units (same as base)
+ENV CARGO_NET_GIT_FETCH_WITH_CLI=true
+ENV CARGO_INCREMENTAL=0
+ENV CARGO_PROFILE_RELEASE_CODEGEN_UNITS=1
+ENV CARGO_PROFILE_RELEASE_LTO=true
+
+# Install cargo-chef for dependency caching (copy from base to avoid reinstall)
+COPY --from=base /usr/local/cargo/bin/cargo-chef /usr/local/cargo/bin/cargo-chef
+
+COPY --from=planner /fennel/recipe.json recipe.json
+RUN cargo chef cook --release --recipe-path recipe.json
+COPY . .
+RUN cargo build --locked --release --target $TARGET
+
+######################## final stage #######################
 FROM docker.io/parity/base-bin:latest
 
-# Copy the node binary
-COPY --from=builder /fennel/target/release/fennel-node /usr/local/bin/fennel-node
+ARG TARGETARCH
+# Copy only the matching binary using canonical Docker pattern  
+# This avoids duplicate binaries and reduces image size by ~18MB
+COPY --from=builder-${TARGETARCH} /fennel/target/*/release/fennel-node /usr/local/bin/fennel-node
 
 # Copy the deterministic wasm compiled with srtool (optional but convenient for
 # governance upgrades & CI verification)
