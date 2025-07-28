@@ -26,11 +26,11 @@ RUN cargo chef cook --release --recipe-path recipe.json
 
 # Cook ARM64 dependencies using Parity's xbuilder (zero-setup ARM64 environment)
 FROM --platform=$BUILDPLATFORM paritytech/xbuilder-aarch64-unknown-linux-gnu:latest AS cook-arm64
-WORKDIR /fennel
 
-# Add ARM64 target to the xbuilder toolchain (one-line setup)
-RUN rustup target add aarch64-unknown-linux-gnu
+# Use xbuilder's expected working directory
+WORKDIR /app
 
+# Target is already installed in xbuilder - no need to add it again
 # Install cargo-chef for dependency optimization
 RUN cargo install cargo-chef
 
@@ -114,16 +114,15 @@ ENV VAL2_AURA_PUB=${VAL2_AURA_PUB}
 ENV VAL2_GRANDPA_PUB=${VAL2_GRANDPA_PUB}
 ENV VAL2_STASH_SS58=${VAL2_STASH_SS58}
 
-WORKDIR /fennel
+# Use xbuilder's expected working directory
+WORKDIR /app
 
-# Add ARM64 target to the xbuilder toolchain (zero-setup, as advertised)
-RUN rustup target add aarch64-unknown-linux-gnu
-
+# Target is already installed in xbuilder image, no need to add it again
 # Copy pre-cooked ARM64 dependencies for faster builds
-COPY --from=cook-arm64 /fennel/target target
+COPY --from=cook-arm64 /app/target target
 COPY --from=planner /fennel/recipe.json recipe.json
 
-# Copy sources and build with pre-cooked dependencies
+# Copy sources and build with xbuilder's pre-configured environment
 COPY . .
 RUN cargo build --locked --release --target aarch64-unknown-linux-gnu
 
@@ -134,7 +133,7 @@ ARG TARGETARCH
 # Copy both binaries using the battle-tested Pattern A approach
 # This avoids variable substitution in --from= which Docker doesn't support
 COPY --from=builder-amd64 /fennel/target/x86_64-unknown-linux-gnu/release/fennel-node /tmp/fennel-node-amd64
-COPY --from=builder-arm64 /fennel/target/aarch64-unknown-linux-gnu/release/fennel-node /tmp/fennel-node-arm64
+COPY --from=builder-arm64 /app/target/aarch64-unknown-linux-gnu/release/fennel-node /tmp/fennel-node-arm64
 
 # Select the correct binary at runtime based on TARGETARCH
 RUN if [ "$TARGETARCH" = "amd64" ]; then \
