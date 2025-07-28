@@ -51,9 +51,8 @@ RUN apt update && apt install -y \
     g++-aarch64-linux-gnu libc6-dev-arm64-cross \
     && apt clean && rm -rf /var/lib/apt/lists/*
 
-# Add ARM64 target and toolchain (Parity's exact pattern)
-RUN rustup target add aarch64-unknown-linux-gnu && \
-    rustup toolchain install stable-aarch64-unknown-linux-gnu
+# Add ARM64 target (Parity's exact pattern)
+RUN rustup target add aarch64-unknown-linux-gnu
 
 # Set up cross-compilation environment (from Parity's xbuilder)
 ENV CC_aarch64_unknown_linux_gnu="aarch64-linux-gnu-gcc" \
@@ -149,9 +148,8 @@ RUN apt update && apt install -y \
     g++-aarch64-linux-gnu libc6-dev-arm64-cross \
     && apt clean && rm -rf /var/lib/apt/lists/*
 
-# Add ARM64 target and toolchain (Parity's exact pattern)
-RUN rustup target add $TARGET && \
-    rustup toolchain install stable-aarch64-unknown-linux-gnu
+# Add ARM64 target (Parity's exact pattern)
+RUN rustup target add $TARGET
 
 # Set up cross-compilation environment (from Parity's xbuilder)
 ENV CC_aarch64_unknown_linux_gnu="aarch64-linux-gnu-gcc" \
@@ -170,7 +168,7 @@ FROM docker.io/parity/base-bin:latest
 
 ARG TARGETARCH
 # Copy both binaries using the battle-tested Pattern A approach
-# This avoids variable substitution in --from= which Docker doesn't support
+# This avoids variable substitution in --from=which Docker doesn't support
 COPY --from=builder-amd64 /fennel/target/x86_64-unknown-linux-gnu/release/fennel-node /tmp/fennel-node-amd64
 COPY --from=builder-arm64 /fennel/target/aarch64-unknown-linux-gnu/release/fennel-node /tmp/fennel-node-arm64
 
