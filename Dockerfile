@@ -123,14 +123,17 @@ ENV VAL2_STASH_SS58=${VAL2_STASH_SS58}
 # Use xbuilder's expected working directory
 WORKDIR /app
 
-# Target is already installed in xbuilder image, no need to add it again
+# Ensure proper toolchain setup (xbuilder provides stable-aarch64-unknown-linux-gnu)
+# The environment variables are already set in the base xbuilder image, but let's be explicit
+ENV SKIP_WASM_BUILD=1
+
 # Copy pre-cooked ARM64 dependencies for faster builds
 COPY --from=cook-arm64 /app/target target
 COPY --from=planner /fennel/recipe.json recipe.json
 
 # Copy sources and build with xbuilder's pre-configured environment
 COPY . .
-RUN cargo build --locked --release --target aarch64-unknown-linux-gnu
+RUN cargo +stable build --locked --release --target aarch64-unknown-linux-gnu
 
 ######################## final stage #######################
 FROM docker.io/parity/base-bin:latest
