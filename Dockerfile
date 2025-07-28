@@ -143,6 +143,9 @@ ENV CARGO_INCREMENTAL=0
 ENV CARGO_PROFILE_RELEASE_CODEGEN_UNITS=1
 ENV CARGO_PROFILE_RELEASE_LTO=true
 
+# Explicitly add the ARM64 target (defensive programming)
+RUN rustup target add $TARGET
+
 # Use Parity's native ARM64 environment - no toolchain switching needed
 # Copy pre-cooked ARM64 dependencies from native ARM64 cook stage
 COPY --from=cook-arm64 /fennel/target target
