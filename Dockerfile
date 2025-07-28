@@ -123,8 +123,11 @@ ENV VAL2_STASH_SS58=${VAL2_STASH_SS58}
 # Use xbuilder's expected working directory
 WORKDIR /app
 
-# Ensure proper toolchain setup (xbuilder provides stable-aarch64-unknown-linux-gnu)
-# The environment variables are already set in the base xbuilder image, but let's be explicit
+# Install ARM64 target and toolchain (following Parity's xbuilder pattern)
+RUN rustup target add aarch64-unknown-linux-gnu && \
+    rustup toolchain install stable-aarch64-unknown-linux-gnu
+
+# Ensure proper cross-compilation environment
 ENV SKIP_WASM_BUILD=1
 
 # Copy pre-cooked ARM64 dependencies for faster builds
