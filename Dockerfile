@@ -105,6 +105,9 @@ ENV CARGO_INCREMENTAL=0
 ENV CARGO_PROFILE_RELEASE_CODEGEN_UNITS=1
 ENV CARGO_PROFILE_RELEASE_LTO=true
 
+# Add the target for cross-compilation
+RUN rustup target add $TARGET
+
 # Install cargo-chef for dependency caching (copy from base to avoid reinstall)
 COPY --from=base /usr/local/cargo/bin/cargo-chef /usr/local/cargo/bin/cargo-chef
 
