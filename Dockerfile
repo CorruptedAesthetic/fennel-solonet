@@ -47,7 +47,7 @@ COPY --from=planner /fennel/recipe.json recipe.json
 RUN cargo chef cook --release --recipe-path recipe.json --target aarch64-unknown-linux-gnu
 
 # --- New stage: deterministic WASM runtime build using srtool -----------------
-FROM docker.io/paritytech/srtool:1.88.0 AS srtool
+FROM docker.io/paritytech/srtool:1.84.1 AS srtool
 
 # The srtool image expects the sources to live in /build
 WORKDIR /build
