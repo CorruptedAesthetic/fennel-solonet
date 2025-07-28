@@ -142,6 +142,9 @@ ENV VAL2_STASH_SS58=${VAL2_STASH_SS58}
 
 WORKDIR /fennel
 
+# Add ARM64 target to the xbuilder toolchain
+RUN rustup target add aarch64-unknown-linux-gnu
+
 # Copy sources and build exactly once - no need for target management
 COPY . .
 RUN cargo build --locked --release --target aarch64-unknown-linux-gnu
