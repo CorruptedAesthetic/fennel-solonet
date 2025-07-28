@@ -24,6 +24,39 @@ FROM base AS cook
 COPY --from=planner /fennel/recipe.json recipe.json
 RUN cargo chef cook --release --recipe-path recipe.json
 
+# Cook ARM64 dependencies using Parity's native ARM64 environment
+FROM docker.io/paritytech/xbuilder-aarch64-unknown-linux-gnu:latest AS cook-arm64
+WORKDIR /fennel
+
+# Production environment variables (passed from build args)
+ARG SUDO_SS58
+ARG VAL1_AURA_PUB
+ARG VAL1_GRANDPA_PUB
+ARG VAL1_STASH_SS58
+ARG VAL2_AURA_PUB
+ARG VAL2_GRANDPA_PUB
+ARG VAL2_STASH_SS58
+
+# Export as environment variables for cargo build
+ENV SUDO_SS58=${SUDO_SS58}
+ENV VAL1_AURA_PUB=${VAL1_AURA_PUB}
+ENV VAL1_GRANDPA_PUB=${VAL1_GRANDPA_PUB}
+ENV VAL1_STASH_SS58=${VAL1_STASH_SS58}
+ENV VAL2_AURA_PUB=${VAL2_AURA_PUB}
+ENV VAL2_GRANDPA_PUB=${VAL2_GRANDPA_PUB}
+ENV VAL2_STASH_SS58=${VAL2_STASH_SS58}
+
+# Optimize cargo for space and reduce compilation units
+ENV CARGO_NET_GIT_FETCH_WITH_CLI=true
+ENV CARGO_INCREMENTAL=0
+ENV CARGO_PROFILE_RELEASE_CODEGEN_UNITS=1
+ENV CARGO_PROFILE_RELEASE_LTO=true
+
+# Install cargo-chef in the ARM64 environment
+RUN cargo install cargo-chef
+COPY --from=planner /fennel/recipe.json recipe.json
+RUN cargo chef cook --release --recipe-path recipe.json --target aarch64-unknown-linux-gnu
+
 # --- New stage: deterministic WASM runtime build using srtool -----------------
 FROM docker.io/paritytech/srtool:1.84.1 AS srtool
 
@@ -110,18 +143,9 @@ ENV CARGO_INCREMENTAL=0
 ENV CARGO_PROFILE_RELEASE_CODEGEN_UNITS=1
 ENV CARGO_PROFILE_RELEASE_LTO=true
 
-# The xbuilder image already has the aarch64 toolchain configured
-# Just switch to it and verify the target is available
-RUN rustup show && \
-    rustup default stable-aarch64-unknown-linux-gnu && \
-    rustup target list --installed && \
-    rustup show
-
-# Install cargo-chef for dependency caching (copy from base to avoid reinstall)
-COPY --from=base /usr/local/cargo/bin/cargo-chef /usr/local/cargo/bin/cargo-chef
-
-# Copy pre-cooked dependencies from cook stage (avoids ARM64 emulation issues)
-COPY --from=cook /fennel/target target
+# Use Parity's native ARM64 environment - no toolchain switching needed
+# Copy pre-cooked ARM64 dependencies from native ARM64 cook stage
+COPY --from=cook-arm64 /fennel/target target
 COPY --from=planner /fennel/recipe.json recipe.json
 COPY . .
 RUN cargo build --locked --release --target $TARGET
