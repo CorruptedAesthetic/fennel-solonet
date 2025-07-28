@@ -120,8 +120,7 @@ COPY . .
 RUN cargo build --locked --release --target $TARGET
 
 ######################## arm64 builder ####################
-FROM base AS builder-arm64
-ARG TARGET=aarch64-unknown-linux-gnu
+FROM --platform=$BUILDPLATFORM paritytech/xbuilder-aarch64-unknown-linux-gnu:latest AS builder-arm64
 
 # Production environment variables (passed from build args)
 ARG SUDO_SS58
@@ -143,32 +142,16 @@ ENV VAL2_STASH_SS58=${VAL2_STASH_SS58}
 
 WORKDIR /fennel
 
-# Install ARM64 cross-compilation tools (following Parity's xbuilder pattern)
-RUN apt update && apt install -y \
-    g++-aarch64-linux-gnu libc6-dev-arm64-cross \
-    && apt clean && rm -rf /var/lib/apt/lists/*
-
-# Add ARM64 target (Parity's exact pattern)
-RUN rustup target add $TARGET
-
-# Set up cross-compilation environment (from Parity's xbuilder)
-ENV CC_aarch64_unknown_linux_gnu="aarch64-linux-gnu-gcc" \
-    CXX_aarch64_unknown_linux_gnu="aarch64-linux-gnu-g++" \
-    BINDGEN_EXTRA_CLANG_ARGS="-I/usr/aarch64-linux-gnu/include/" \
-    CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_LINKER="aarch64-linux-gnu-gcc"
-
-# Use consistent toolchain - copy pre-cooked ARM64 dependencies from consistent cook stage
-COPY --from=cook-arm64 /fennel/target target
-COPY --from=planner /fennel/recipe.json recipe.json
+# Copy sources and build exactly once - no need for target management
 COPY . .
-RUN cargo build --locked --release --target $TARGET
+RUN cargo build --locked --release --target aarch64-unknown-linux-gnu
 
 ######################## final stage #######################
 FROM docker.io/parity/base-bin:latest
 
 ARG TARGETARCH
 # Copy both binaries using the battle-tested Pattern A approach
-# This avoids variable substitution in --from=which Docker doesn't support
+# This avoids variable substitution in --from= which Docker doesn't support
 COPY --from=builder-amd64 /fennel/target/x86_64-unknown-linux-gnu/release/fennel-node /tmp/fennel-node-amd64
 COPY --from=builder-arm64 /fennel/target/aarch64-unknown-linux-gnu/release/fennel-node /tmp/fennel-node-arm64
 
