@@ -373,7 +373,7 @@ jobs:
               -e VAL2_GRANDPA_PUB="${PROD_VAL2_GRANDPA_PUB}" \
               -e VAL2_STASH_SS58="${PROD_VAL2_STASH_SS58}" \
               --workdir /build \
-              paritytech/srtool:1.84.1
+              paritytech/srtool:1.88.0
           else
             echo "🧪 Building development/staging runtime (no production env vars needed)"
             
@@ -384,7 +384,7 @@ jobs:
               -e RUNTIME_DIR=runtime/fennel \
               -e PACKAGE=fennel-node-runtime \
               --workdir /build \
-              paritytech/srtool:1.84.1
+              paritytech/srtool:1.88.0
           fi
 
           # After the container exits the compiled Wasm lives in the mounted volume

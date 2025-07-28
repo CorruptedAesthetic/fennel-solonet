@@ -6,7 +6,7 @@ WORKDIR /fennel
 
 # Install cargo-chef and pre-fetch the wasm target once
 RUN cargo install cargo-chef \
-    && rustup target add wasm32-unknown-unknown --toolchain 1.84.1-x86_64-unknown-linux-gnu
+    && rustup target add wasm32-unknown-unknown
 
 # Optimize cargo for space and reduce compilation units
 ENV CARGO_NET_GIT_FETCH_WITH_CLI=true
@@ -24,25 +24,30 @@ FROM base AS cook
 COPY --from=planner /fennel/recipe.json recipe.json
 RUN cargo chef cook --release --recipe-path recipe.json
 
-# Cook ARM64 dependencies using Parity's xbuilder (zero-setup ARM64 environment)
-# Pin to specific version for production stability instead of :latest
-# Note: Parity uses SHA+date versioning (e.g., a1b2c3d4-20250728)
-# TODO: Pin to specific version once build succeeds with :latest
-FROM --platform=$BUILDPLATFORM paritytech/xbuilder-aarch64-unknown-linux-gnu:latest AS cook-arm64
+# Cook ARM64 dependencies using ci-unified with cross-compilation setup
+FROM base AS cook-arm64
 
-# Use xbuilder's expected working directory
-WORKDIR /app
+# Install ARM64 cross-compilation tools
+RUN apt update && apt upgrade -y && \
+    apt install -y \
+        g++-aarch64-linux-gnu libc6-dev-arm64-cross \
+        pkg-config libssl-dev && \
+    rm -rf /var/lib/apt/lists/* /tmp/* && apt clean && \
+    rustup target add aarch64-unknown-linux-gnu
 
-# Target is already installed in xbuilder - no need to add it again
-# Install cargo-chef for dependency optimization
-RUN cargo install cargo-chef
+# Set up cross-compilation environment variables
+ENV CC_aarch64_unknown_linux_gnu="aarch64-linux-gnu-gcc" \
+    CXX_aarch64_unknown_linux_gnu="aarch64-linux-gnu-g++" \
+    BINDGEN_EXTRA_CLANG_ARGS="-I/usr/aarch64-linux-gnu/include/" \
+    CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_LINKER="aarch64-linux-gnu-gcc" \
+    SKIP_WASM_BUILD=1
 
 # Cook ARM64 dependencies
 COPY --from=planner /fennel/recipe.json recipe.json
 RUN cargo chef cook --release --recipe-path recipe.json --target aarch64-unknown-linux-gnu
 
 # --- New stage: deterministic WASM runtime build using srtool -----------------
-FROM docker.io/paritytech/srtool:1.84.1 AS srtool
+FROM docker.io/paritytech/srtool:1.88.0 AS srtool
 
 # The srtool image expects the sources to live in /build
 WORKDIR /build
@@ -97,10 +102,7 @@ COPY . .
 RUN cargo build --locked --release --target $TARGET
 
 ######################## arm64 builder ####################
-# Pin to specific version for production stability instead of :latest
-# Note: Parity uses SHA+date versioning (e.g., a1b2c3d4-20250728)
-# TODO: Pin to specific version once build succeeds with :latest
-FROM --platform=$BUILDPLATFORM paritytech/xbuilder-aarch64-unknown-linux-gnu:latest AS builder-arm64
+FROM base AS builder-arm64
 
 # Production environment variables (passed from build args)
 ARG SUDO_SS58
@@ -120,18 +122,23 @@ ENV VAL2_AURA_PUB=${VAL2_AURA_PUB}
 ENV VAL2_GRANDPA_PUB=${VAL2_GRANDPA_PUB}
 ENV VAL2_STASH_SS58=${VAL2_STASH_SS58}
 
-# Use xbuilder's expected working directory
-WORKDIR /app
+# Install ARM64 cross-compilation tools (same as cook-arm64 stage)
+RUN apt update && apt upgrade -y && \
+    apt install -y \
+        g++-aarch64-linux-gnu libc6-dev-arm64-cross \
+        pkg-config libssl-dev && \
+    rm -rf /var/lib/apt/lists/* /tmp/* && apt clean && \
+    rustup target add aarch64-unknown-linux-gnu
 
-# Install ARM64 target and toolchain (following Parity's xbuilder pattern)
-RUN rustup target add aarch64-unknown-linux-gnu && \
-    rustup toolchain install stable-aarch64-unknown-linux-gnu
-
-# Ensure proper cross-compilation environment
-ENV SKIP_WASM_BUILD=1
+# Set up cross-compilation environment variables
+ENV CC_aarch64_unknown_linux_gnu="aarch64-linux-gnu-gcc" \
+    CXX_aarch64_unknown_linux_gnu="aarch64-linux-gnu-g++" \
+    BINDGEN_EXTRA_CLANG_ARGS="-I/usr/aarch64-linux-gnu/include/" \
+    CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_LINKER="aarch64-linux-gnu-gcc" \
+    SKIP_WASM_BUILD=1
 
 # Copy pre-cooked ARM64 dependencies for faster builds
-COPY --from=cook-arm64 /app/target target
+COPY --from=cook-arm64 /fennel/target target
 COPY --from=planner /fennel/recipe.json recipe.json
 
 # Copy sources and build with xbuilder's pre-configured environment
@@ -145,7 +152,7 @@ ARG TARGETARCH
 # Copy both binaries using the battle-tested Pattern A approach
 # This avoids variable substitution in --from= which Docker doesn't support
 COPY --from=builder-amd64 /fennel/target/x86_64-unknown-linux-gnu/release/fennel-node /tmp/fennel-node-amd64
-COPY --from=builder-arm64 /app/target/aarch64-unknown-linux-gnu/release/fennel-node /tmp/fennel-node-arm64
+COPY --from=builder-arm64 /fennel/target/aarch64-unknown-linux-gnu/release/fennel-node /tmp/fennel-node-arm64
 
 # Select the correct binary at runtime based on TARGETARCH
 RUN if [ "$TARGETARCH" = "amd64" ]; then \
