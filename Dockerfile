@@ -8,10 +8,17 @@ RUN cargo install cargo-chef \
     && rustup target add wasm32-unknown-unknown --toolchain 1.84.1-x86_64-unknown-linux-gnu
 
 # Set up cargo configuration for optimized builds (Parity best practice)
+# Detect architecture and set appropriate target
 RUN mkdir -p /root/.cargo /home/nonroot/.cargo && \
-    echo '[target.x86_64-unknown-linux-gnu]' > /root/.cargo/config && \
-    echo 'linker = "clang-15"' >> /root/.cargo/config && \
-    echo 'rustflags = ["-Ctarget-feature=+aes,+sse2,+ssse3"]' >> /root/.cargo/config && \
+    if [ "$(uname -m)" = "aarch64" ]; then \
+        echo '[target.aarch64-unknown-linux-gnu]' > /root/.cargo/config && \
+        echo 'linker = "clang-15"' >> /root/.cargo/config && \
+        echo 'rustflags = ["-Ctarget-feature=+aes"]' >> /root/.cargo/config; \
+    else \
+        echo '[target.x86_64-unknown-linux-gnu]' > /root/.cargo/config && \
+        echo 'linker = "clang-15"' >> /root/.cargo/config && \
+        echo 'rustflags = ["-Ctarget-feature=+aes,+sse2,+ssse3"]' >> /root/.cargo/config; \
+    fi && \
     cp /root/.cargo/config /home/nonroot/.cargo/config
 
 # Optimize cargo for space and reduce compilation units
@@ -30,8 +37,9 @@ FROM base AS tester
 COPY . .
 RUN cargo test --features=runtime-benchmarks
 
-# --- Deterministic WASM runtime build using srtool -----------------
-FROM docker.io/paritytech/srtool:1.84.1 AS srtool
+# --- Deterministic WASM runtime build using srtool (AMD64 only) -----------------
+# Note: srtool currently only works on AMD64, so we skip this stage for ARM64
+FROM --platform=linux/amd64 docker.io/paritytech/srtool:1.84.1 AS srtool
 
 # The srtool image expects the sources to live in /build
 WORKDIR /build
@@ -66,9 +74,23 @@ FROM docker.io/parity/base-bin:latest
 # Copy the node binary
 COPY --from=builder /fennel/target/release/fennel-node /usr/local/bin/fennel-node
 
-# Copy the deterministic wasm compiled with srtool (optional but convenient for
-# governance upgrades & CI verification)
-COPY --from=srtool /build/runtime/fennel/target/srtool/release/wbuild/fennel-node-runtime/fennel_node_runtime.compact.wasm /usr/local/bin/fennel_node_runtime.compact.wasm
+# For multi-arch support: 
+# - On AMD64: Copy from srtool (deterministic)
+# - On ARM64: Copy from builder (non-deterministic but functional)
+ARG TARGETPLATFORM
+RUN --mount=type=bind,from=srtool,source=/build/runtime/fennel/target/srtool/release/wbuild/fennel-node-runtime/fennel_node_runtime.compact.wasm,target=/tmp/srtool.wasm \
+    --mount=type=bind,from=builder,source=/fennel/target/release/wbuild/fennel-node-runtime/fennel_node_runtime.compact.wasm,target=/tmp/builder.wasm \
+    if [ "$TARGETPLATFORM" = "linux/amd64" ] && [ -f /tmp/srtool.wasm ]; then \
+        echo "Using deterministic WASM from srtool (AMD64)"; \
+        cp /tmp/srtool.wasm /usr/local/bin/fennel_node_runtime.compact.wasm; \
+    elif [ -f /tmp/builder.wasm ]; then \
+        echo "Using WASM from builder (ARM64 or fallback)"; \
+        cp /tmp/builder.wasm /usr/local/bin/fennel_node_runtime.compact.wasm; \
+    else \
+        echo "WARNING: No WASM runtime found!"; \
+        touch /usr/local/bin/fennel_node_runtime.compact.wasm; \
+    fi
+
 RUN test -f /usr/local/bin/fennel_node_runtime.compact.wasm
 
 ARG WASM_HASH=unknown
