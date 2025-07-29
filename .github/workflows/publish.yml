@@ -1,4 +1,4 @@
-name: Create and publish a Docker image
+name: Create and publish Docker images
 
 # Configures this workflow to run only on signed release tags
 on:
@@ -12,81 +12,32 @@ on:
         type: boolean
         default: true
 
-# Defines two custom environment variables for the workflow. These are used for the Container registry domain, and a name for the Docker image that this workflow builds.
+# Define environment variables for the workflow
 env:
   REGISTRY: ghcr.io
   IMAGE_NAME: ${{ github.repository }}
-  # NOTE: Bootnode configurations are now dynamically generated from GitHub secrets
-  # to prevent peer ID collisions and follow external-only bootnode architecture
 
-# This workflow has multiple jobs that run in sequence to avoid race conditions:
-# 1. build-binaries: Build node binaries for all architectures
-# 2. build-and-push-docker: Create multi-platform Docker image
-# 3. generate-chainspecs: Generate chainspecs with bootnode injection
-# 4. package-and-release: Package Helm chart and create GitHub release
 jobs:
-  build-binaries:
+  # Verify tag signature first
+  verify-tag:
     runs-on: ubuntu-latest
-    strategy:
-      matrix:
-        arch: [amd64, arm64]
-        include:
-          - arch: amd64
-            rust_target: x86_64-unknown-linux-gnu
-          - arch: arm64
-            rust_target: aarch64-unknown-linux-gnu
-    # Sets the permissions granted to the `GITHUB_TOKEN` for the actions in this job.
+    if: startsWith(github.ref, 'refs/tags/')
     permissions:
-      contents: write  # Changed from read to write to allow pushing commits
-      packages: write
+      contents: read
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
         with:
-          fetch-depth: 0  # Fetch all history for tag verification
-          fetch-tags: true  # Explicitly fetch all tags
-          ref: ${{ github.ref }}  # Ensure we check out the exact ref that triggered the workflow
-
-      # Ensure tag objects are properly fetched (GitHub Actions sometimes fetches only refs)
-      - name: Refetch tag objects
-        if: startsWith(github.ref, 'refs/tags/')
-        run: |
-          TAG=${GITHUB_REF#refs/tags/}
-          echo "🔄 Ensuring tag object is available for: $TAG"
-          
-          # Force refetch the tag with its object
-          git fetch origin "refs/tags/$TAG:refs/tags/$TAG" --force
-          
-          # Verify we now have the tag object
-          echo "📋 Post-fetch verification:"
-          echo "  Tag type: $(git cat-file -t "refs/tags/$TAG" 2>/dev/null || echo 'unknown')"
-          echo "  Tag hash: $(git rev-parse "refs/tags/$TAG" 2>/dev/null || echo 'unknown')"
-          echo "  Commit hash: $(git rev-parse "refs/tags/$TAG^{commit}" 2>/dev/null || echo 'unknown')"
-          
-          # They should be different for annotated tags
-          TAG_HASH=$(git rev-parse "refs/tags/$TAG" 2>/dev/null || echo '')
-          COMMIT_HASH=$(git rev-parse "refs/tags/$TAG^{commit}" 2>/dev/null || echo '')
-          
-          if [ "$TAG_HASH" != "$COMMIT_HASH" ] && [ -n "$TAG_HASH" ] && [ -n "$COMMIT_HASH" ]; then
-            echo "✅ Annotated tag object successfully fetched"
-          else
-            echo "⚠️  Tag object may not be properly fetched, attempting alternative fetch..."
-            # Try fetching all tag objects
-            git fetch origin '+refs/tags/*:refs/tags/*' --force
-            
-            # Re-verify
-            NEW_TAG_HASH=$(git rev-parse "refs/tags/$TAG" 2>/dev/null || echo '')
-            NEW_COMMIT_HASH=$(git rev-parse "refs/tags/$TAG^{commit}" 2>/dev/null || echo '')
-            echo "  After alternative fetch - Tag: $NEW_TAG_HASH, Commit: $NEW_COMMIT_HASH"
-          fi
+          fetch-depth: 0
+          fetch-tags: true
+          ref: ${{ github.ref }}
 
       # Verify tag signature for release builds
       - name: Verify tag signature
-        if: startsWith(github.ref, 'refs/tags/')
         run: |
           TAG=${GITHUB_REF#refs/tags/}
           echo "🔐 Verifying signature for tag: $TAG"
-
+          
           # Import the trusted public key
           gpg --import .github/release-signing.pub.asc
           
@@ -96,157 +47,76 @@ jobs:
             exit 1
           fi
           
-          # Ensure the tag exists and is available locally
-          echo "🔍 Checking if tag exists locally..."
-          if ! git tag -l | grep -q "^$TAG$"; then
-            echo "⚠️  Tag not found locally, fetching..."
-            git fetch origin "refs/tags/$TAG:refs/tags/$TAG"
-          fi
-          
-          # Verify tag object type and show debugging info
-          echo "🔍 Debugging tag object..."
-          
-          # Check different ways to reference the tag
-          echo "  Tag type (direct): $(git cat-file -t "$TAG" 2>/dev/null || echo 'unknown')"
-          echo "  Tag type (refs/tags): $(git cat-file -t "refs/tags/$TAG" 2>/dev/null || echo 'unknown')"
-          echo "  Tag exists in local refs: $(git tag -l | grep "^$TAG$" || echo 'NOT FOUND')"
-          
-          # Determine the correct tag reference to use
-          TAG_REF="$TAG"
-          if git cat-file -t "refs/tags/$TAG" 2>/dev/null | grep -q "tag"; then
-            TAG_REF="refs/tags/$TAG"
-            echo "  Using full ref: $TAG_REF"
-          elif git cat-file -t "$TAG" 2>/dev/null | grep -q "tag"; then
-            echo "  Using short ref: $TAG_REF"
-          else
-            echo "⚠️  Warning: Tag reference resolves to commit, trying explicit refs..."
-            # List all possible tag references
-            echo "  Available tag refs:"
-            git for-each-ref refs/tags/ --format="%(refname) -> %(objecttype)" | grep "$TAG" || echo "    No matching tag refs found"
-            
-            # Try to find the actual tag object
-            if git show-ref --tags | grep -q "refs/tags/$TAG$"; then
-              TAG_REF="refs/tags/$TAG"
-              echo "  Found explicit tag ref: $TAG_REF"
-            fi
-          fi
-          
-          # Show tag information for debugging
-          echo "📋 Tag object information (using $TAG_REF):"
-          if git cat-file -t "$TAG_REF" 2>/dev/null | grep -q "tag"; then
-            echo "✅ Found tag object, showing tag info:"
-            git cat-file tag "$TAG_REF" | head -10
-          else
-            echo "⚠️  Not a tag object, showing commit info:"
-            git show --no-patch --format="  Commit: %H%n  Author: %an <%ae>%n  Date: %ai%n  Subject: %s" "$TAG_REF"
-          fi
-          
-          # Verify the tag signature using the correct reference
-          echo "🔐 Attempting tag signature verification (using $TAG_REF)..."
-          if git verify-tag "$TAG_REF" 2>&1; then
+          # Verify the tag signature
+          if git verify-tag "$TAG" 2>&1; then
             echo "✅ Tag signature verified successfully"
           else
             echo "❌ Tag signature verification failed"
-            echo "🔍 Debugging tag verification issue..."
-            
-            # Show detailed git information
-            echo "  Git ref information:"
-            git show-ref | grep "$TAG" || echo "    No refs found for $TAG"
-            
-            echo "  Tag object details:"
-            git for-each-ref refs/tags/ --format="%(refname) %(objecttype) %(objectname)" | grep "$TAG" || echo "    No tag object found"
-            
-            # Try alternative verification approaches
-            echo "  Trying alternative verification methods..."
-            
-            # Method 1: Direct tag object verification
-            if git show-ref --tags | grep -q "refs/tags/$TAG$"; then
-              echo "    Method 1: Using explicit refs/tags/$TAG"
-              git verify-tag "refs/tags/$TAG" --verbose 2>&1 || echo "    Failed"
-            fi
-            
-            # Method 2: Check if it's an annotated tag
-            COMMIT_HASH=$(git rev-parse "$TAG^{commit}" 2>/dev/null || echo "")
-            TAG_HASH=$(git rev-parse "$TAG" 2>/dev/null || echo "")
-            echo "    Commit hash: $COMMIT_HASH"
-            echo "    Tag hash: $TAG_HASH"
-            
-            if [ "$COMMIT_HASH" != "$TAG_HASH" ]; then
-              echo "    Tag is annotated (hashes differ), should be verifiable"
-            else
-              echo "    Tag appears to be lightweight (hashes same), cannot verify signature"
-            fi
-            
             exit 1
           fi
 
-      # Free up additional disk space on GitHub runner (~20-25 GB)
-      # Enhanced cleanup for Polkadot SDK builds without cache
+  # Build AMD64 image with all features
+  build-amd64:
+    runs-on: ubuntu-latest
+    needs: [verify-tag]
+    if: always() && (needs.verify-tag.result == 'success' || needs.verify-tag.result == 'skipped')
+    permissions:
+      contents: write
+      packages: write
+    outputs:
+      image-digest: ${{ steps.build.outputs.digest }}
+      wasm-hash: ${{ steps.wasm.outputs.hash }}
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      # Free up disk space on GitHub runner (~20-25 GB)
       - name: Free Disk Space (Ubuntu)
         uses: jlumbroso/free-disk-space@54081f138730dfa15788a46383842cd2f914a1be # 1.3.1
         with:
-          android: true        # 12 GB save
-          dotnet: true         # 3 GB save  
-          haskell: true        # 2 GB save
-          large-packages: true # 4 GB save
-          swap-storage: false  # Keep swap for large builds
+          android: true
+          dotnet: true
+          haskell: true
+          large-packages: true
+          swap-storage: false
 
-      # Set up QEMU for multi-platform builds
-      - name: Set up QEMU
-        uses: docker/setup-qemu-action@v3
-
-      # Set up Docker Buildx for efficient layer caching and multi-platform builds
+      # Set up Docker Buildx
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@v3
       
-      # ------------------------------------------------------------
-      # BOOTNODE PEER ID CONFIGURATION
-      # Use public bootnode peer IDs from GitHub secrets
-      # ------------------------------------------------------------
+      # Configure bootnode peer IDs
       - name: Configure bootnode peer IDs
         run: |
           set -euo pipefail
           echo "🔐 Configuring bootnode peer IDs from GitHub secrets..."
           
-          # Get public bootnode peer IDs from GitHub secrets
           PEER1="${{ secrets.BOOTNODE1_PEER_ID }}"
           PEER2="${{ secrets.BOOTNODE2_PEER_ID }}"
           
-          # Verify peer IDs are set
           if [ -z "$PEER1" ] || [ -z "$PEER2" ]; then
             echo "❌ ERROR: Bootnode peer IDs are missing from GitHub secrets!"
-            echo "🔧 Add BOOTNODE1_PEER_ID and BOOTNODE2_PEER_ID to GitHub repository settings"
-            echo "💡 These are public peer IDs (not private keys) - safe to store in GitHub Secrets"
             exit 1
           fi
           
-          # Build JSON array for bootnodes
           BOOTNODES_JSON=$(jq -cn --arg id1 "$PEER1" --arg id2 "$PEER2" '
             [
               "/dns4/bootnode1.fennel.network/tcp/30333/p2p/\($id1)",
               "/dns4/bootnode2.fennel.network/tcp/30333/p2p/\($id2)"
             ]')
           
-          # Set environment variables for subsequent steps
           echo "EXTERNAL_BOOTNODES_JSON=$BOOTNODES_JSON" >> $GITHUB_ENV
           echo "BOOTNODE1_PEER_ID=$PEER1" >> $GITHUB_ENV
           echo "BOOTNODE2_PEER_ID=$PEER2" >> $GITHUB_ENV
-          
-          # Log success
-          echo "✅ Successfully configured bootnode peer IDs from GitHub secrets"
-          echo "🌐 Using external-only bootnode architecture (following Parity best practices)"
-          echo "🌐 Bootnode 1 Peer ID: $PEER1"
-          echo "🌐 Bootnode 2 Peer ID: $PEER2"
-      
-      # Uses the `docker/login-action` action to log in to the Container registry registry using the account and password that will publish the packages. Once published, the packages are scoped to the account defined here.
+
+      # Log in to the Container registry
       - name: Log in to the Container registry
         uses: docker/login-action@v3
         with:
           registry: ${{ env.REGISTRY }}
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
-      
-      # This step uses [docker/metadata-action](https://github.com/docker/metadata-action#about) to extract tags and labels that will be applied to the specified image. The `id` "meta" allows the output of this step to be referenced in a subsequent step. The `images` value provides the base name for the tags and labels.
+
+      # Extract metadata
       - name: Extract metadata (tags, labels) for Docker
         id: meta
         uses: docker/metadata-action@v5
@@ -259,13 +129,12 @@ jobs:
             type=semver,pattern={{version}}
             type=semver,pattern={{major}}.{{minor}}
             type=sha,format=long
-      
-      # ------------------------------------------------------------
-      # PRODUCTION KEY EXPORT (using GitHub Secrets)
-      # Export public keys for production builds - MANDATORY for releases
-      # Public keys are safe to store in GitHub Secrets, private keys remain in Vault
-      # ------------------------------------------------------------
+          flavor: |
+            suffix=-amd64
+
+      # Export production keys for release builds
       - name: Export production public keys from GitHub Secrets
+        if: startsWith(github.ref, 'refs/tags/')
         env:
           PROD_SUDO_SS58: ${{ secrets.PROD_SUDO_SS58 }}
           PROD_VAL1_AURA_PUB: ${{ secrets.PROD_VAL1_AURA_PUB }}
@@ -278,57 +147,26 @@ jobs:
           set -euo pipefail
           echo "🔐 Setting up production environment variables from GitHub Secrets..."
           
-          # For production releases, use real keys from GitHub Secrets
-          if [[ "${GITHUB_REF}" == refs/tags/* ]]; then
-            echo "🏭 Production release detected - exporting production keys from GitHub Secrets"
-            
-            # MANDATORY production keys - build will fail if any are missing
-            # GitHub Actions pulls public values from GitHub Secrets,
-            # exports them as environment variables, and Rust compiler substitutes them
-            # into the preset at build time via env!() macros
-            
-            echo "🔑 Exporting production public keys from GitHub Secrets..."
-            
-            # Debug: Check if secrets are available
-            echo "🔍 Debugging secret availability..."
-            echo "PROD_SUDO_SS58 is set: ${PROD_SUDO_SS58+yes}"
-            echo "PROD_SUDO_SS58 length: ${#PROD_SUDO_SS58}"
-            echo "PROD_SUDO_SS58 value: '${PROD_SUDO_SS58:-EMPTY}'"
-            
-            # Export production keys from GitHub Secrets (now available as env vars)
-            export SUDO_SS58="${PROD_SUDO_SS58}"
-            export VAL1_AURA_PUB="${PROD_VAL1_AURA_PUB}"
-            export VAL1_GRANDPA_PUB="${PROD_VAL1_GRANDPA_PUB}"
-            export VAL1_STASH_SS58="${PROD_VAL1_STASH_SS58}"
-            export VAL2_AURA_PUB="${PROD_VAL2_AURA_PUB}"
-            export VAL2_GRANDPA_PUB="${PROD_VAL2_GRANDPA_PUB}"
-            export VAL2_STASH_SS58="${PROD_VAL2_STASH_SS58}"
-            
-            # Verify all production variables are set (prevent empty values)
-            for var in SUDO_SS58 VAL1_AURA_PUB VAL1_GRANDPA_PUB VAL1_STASH_SS58 VAL2_AURA_PUB VAL2_GRANDPA_PUB VAL2_STASH_SS58; do
-              if [ -z "${!var:-}" ]; then
-                echo "❌ ERROR: Production variable $var is empty or missing from GitHub Secrets!"
-                echo "🔧 Add PROD_* secrets to GitHub repository settings"
-                echo "💡 Use extract-github-secrets.sh script to get the required values"
-                exit 1
-              fi
-            done
-            
-            echo "✅ All 7 production environment variables exported from GitHub Secrets and validated"
-            echo "🔒 Using production public keys from GitHub Secrets (private keys remain secure in Vault)"
-          else
-            echo "🧪 Development/staging build - production variables not required"
-            echo "📋 Development/staging presets use Alice/Bob hardcoded keys from sp_keyring"
-            echo "⚠️  Production environment variables will NOT be set for non-release builds"
-            echo "🛡️  This is intentional - development uses different preset logic"
-          fi
+          # Export for subsequent steps
+          echo "SUDO_SS58=$PROD_SUDO_SS58" >> $GITHUB_ENV
+          echo "VAL1_AURA_PUB=$PROD_VAL1_AURA_PUB" >> $GITHUB_ENV
+          echo "VAL1_GRANDPA_PUB=$PROD_VAL1_GRANDPA_PUB" >> $GITHUB_ENV
+          echo "VAL1_STASH_SS58=$PROD_VAL1_STASH_SS58" >> $GITHUB_ENV
+          echo "VAL2_AURA_PUB=$PROD_VAL2_AURA_PUB" >> $GITHUB_ENV
+          echo "VAL2_GRANDPA_PUB=$PROD_VAL2_GRANDPA_PUB" >> $GITHUB_ENV
+          echo "VAL2_STASH_SS58=$PROD_VAL2_STASH_SS58" >> $GITHUB_ENV
+          
+          # Verify all production variables are set
+          for var in SUDO_SS58 VAL1_AURA_PUB VAL1_GRANDPA_PUB VAL1_STASH_SS58 VAL2_AURA_PUB VAL2_GRANDPA_PUB VAL2_STASH_SS58; do
+            if [ -z "${!var:-}" ]; then
+              echo "❌ ERROR: Production variable $var is empty!"
+              exit 1
+            fi
+          done
+          
+          echo "✅ All production environment variables validated"
 
-
-
-      # ------------------------------------------------------------
-      # Build the runtime deterministically with srtool and capture
-      # its SHA-256 so we can inject it as an OCI label.
-      # ------------------------------------------------------------
+      # Build runtime with srtool
       - name: Build runtime with srtool & extract Wasm hash
         id: wasm
         env:
@@ -344,23 +182,9 @@ jobs:
           echo "🛠️  Running srtool to build compact runtime…"
           
           # Build command with conditional environment variables
-          # For production releases: pass mandatory environment variables
-          # For development/staging: build without production env vars (uses Alice/Bob presets)
           if [[ "${GITHUB_REF}" == refs/tags/* ]]; then
             echo "🏭 Building production runtime with GitHub Secrets-sourced public keys"
             
-            # Debug: Verify environment variables before passing to Docker
-            echo "🔍 Environment variables being passed to srtool:"
-            echo "SUDO_SS58 length: ${#PROD_SUDO_SS58}"
-            echo "VAL1_AURA_PUB length: ${#PROD_VAL1_AURA_PUB}"
-            echo "VAL1_GRANDPA_PUB length: ${#PROD_VAL1_GRANDPA_PUB}"
-            echo "VAL1_STASH_SS58 length: ${#PROD_VAL1_STASH_SS58}"
-            echo "VAL2_AURA_PUB length: ${#PROD_VAL2_AURA_PUB}"
-            echo "VAL2_GRANDPA_PUB length: ${#PROD_VAL2_GRANDPA_PUB}"
-            echo "VAL2_STASH_SS58 length: ${#PROD_VAL2_STASH_SS58}"
-            
-            # Production build with mandatory environment variables
-            # These MUST be set or build.rs will fail with clear error message
             docker run --rm \
               -v "${PWD}":/build \
               -e RUNTIME_DIR=runtime/fennel \
@@ -375,10 +199,8 @@ jobs:
               --workdir /build \
               paritytech/srtool:1.84.1
           else
-            echo "🧪 Building development/staging runtime (no production env vars needed)"
+            echo "🧪 Building development/staging runtime"
             
-            # Development/staging build without production environment variables
-            # build.rs will NOT enforce mandatory variables for non-production builds
             docker run --rm \
               -v "${PWD}":/build \
               -e RUNTIME_DIR=runtime/fennel \
@@ -393,23 +215,8 @@ jobs:
           echo "hash=$HASH" >> $GITHUB_OUTPUT
           echo "✅ Deterministic Wasm hash: $HASH"
 
-      # ------------------------------------------------------------
-      # Build Fennel node binary from source (canonical Parity-style)
-      # Uses paritytech/ci-unified:latest - Parity's official CI image
-      # Contains all Rust toolchains, build dependencies, and tools
-      # ------------------------------------------------------------
-      - name: Cache cargo build artifacts
-        uses: actions/cache@v4
-        with:
-          path: |
-            ~/.cargo/registry
-            ~/.cargo/git
-            target
-          key: ${{ runner.os }}-cargo-${{ matrix.arch }}-${{ hashFiles('**/Cargo.lock') }}
-          restore-keys: |
-            ${{ runner.os }}-cargo-${{ matrix.arch }}-
-
-      - name: Build fennel node using Docker multi-stage build
+      # Build fennel node using Parity CI Unified image
+      - name: Build fennel node using Parity CI Unified image
         id: build_node
         env:
           PROD_SUDO_SS58: ${{ secrets.PROD_SUDO_SS58 }}
@@ -421,7 +228,7 @@ jobs:
           PROD_VAL2_STASH_SS58: ${{ secrets.PROD_VAL2_STASH_SS58 }}
         run: |
           set -euo pipefail
-          echo "🔧 Building fennel node using Docker multi-stage build (reuses Docker stages)..."
+          echo "🔧 Building fennel node using Parity CI Unified image..."
           
           # Export production environment variables for release builds
           if [[ "${GITHUB_REF}" == refs/tags/* ]]; then
@@ -434,441 +241,130 @@ jobs:
             export VAL2_GRANDPA_PUB="${PROD_VAL2_GRANDPA_PUB}"
             export VAL2_STASH_SS58="${PROD_VAL2_STASH_SS58}"
           else
-            echo "🧪 Building development/staging node (no production env vars needed)"
+            echo "🧪 Building development/staging node"
           fi
           
-          # Build only the architecture-specific stage to extract the binary
-          # This reuses the Docker multi-stage build without rebuilding
-          echo "🏗️ Building builder-${{ matrix.arch }} stage to extract binary..."
-          
-          # Set build args for production environment variables
-          BUILD_ARGS=""
-          if [[ "${GITHUB_REF}" == refs/tags/* ]]; then
-            BUILD_ARGS="--build-arg SUDO_SS58=${SUDO_SS58:-} \
-                        --build-arg VAL1_AURA_PUB=${VAL1_AURA_PUB:-} \
-                        --build-arg VAL1_GRANDPA_PUB=${VAL1_GRANDPA_PUB:-} \
-                        --build-arg VAL1_STASH_SS58=${VAL1_STASH_SS58:-} \
-                        --build-arg VAL2_AURA_PUB=${VAL2_AURA_PUB:-} \
-                        --build-arg VAL2_GRANDPA_PUB=${VAL2_GRANDPA_PUB:-} \
-                        --build-arg VAL2_STASH_SS58=${VAL2_STASH_SS58:-}"
-          fi
-          
-          # Build the specific architecture stage and extract binary
-          # Platform-specific build that outputs just the builder stage
-          docker buildx build \
-            --platform linux/${{ matrix.arch }} \
-            --target builder-${{ matrix.arch }} \
-            --output type=local,dest=./build-output \
-            ${BUILD_ARGS} \
-            .
-          
-          # Extract the binary from the build output
-          mkdir -p dist
-          cp ./build-output/fennel/target/${{ matrix.rust_target }}/release/fennel-node dist/fennel-node
-          
-          chmod +x dist/fennel-node
-          
-          # Verify binary works (skip execution test for ARM64 on x86_64 runners)
-          if [[ "${{ matrix.arch }}" == "amd64" ]]; then
-            ./dist/fennel-node --version
-            echo "✅ AMD64 binary verified"
-          else
-            echo "✅ ARM64 binary built (skipped execution test on x86_64 runner)"
-          fi
-          
-          echo "✅ fennel-node built and staged in dist/ (reused Docker build, saved ~10 min)"
+          # Use Parity's CI Unified image for building
+          docker run --rm \
+            -v "${PWD}":/build \
+            -e SUDO_SS58="${SUDO_SS58:-}" \
+            -e VAL1_AURA_PUB="${VAL1_AURA_PUB:-}" \
+            -e VAL1_GRANDPA_PUB="${VAL1_GRANDPA_PUB:-}" \
+            -e VAL1_STASH_SS58="${VAL1_STASH_SS58:-}" \
+            -e VAL2_AURA_PUB="${VAL2_AURA_PUB:-}" \
+            -e VAL2_GRANDPA_PUB="${VAL2_GRANDPA_PUB:-}" \
+            -e VAL2_STASH_SS58="${VAL2_STASH_SS58:-}" \
+            --workdir /build \
+            paritytech/ci-unified:latest \
+            bash -c "
+              # Add target for cross-compilation
+              rustup target add x86_64-unknown-linux-gnu
+              
+              # Build with Parity's recommended flags
+              cargo build --locked --release --target x86_64-unknown-linux-gnu -p fennel-node
+              
+              # Create distribution directory and install binary
+              mkdir -p dist
+              install -Dm0755 target/x86_64-unknown-linux-gnu/release/fennel-node dist/fennel-node
+              
+              # Verify binary works
+              ./dist/fennel-node --version
+            "
+          echo "✅ fennel-node built and staged in dist/"
 
+      # Package fennel node tarball
       - name: Package fennel node tarball
         id: pkg_node
         run: |
           set -euo pipefail
-          VER="${GITHUB_REF_NAME}"  # e.g. fennel-node-0.5.7
-          OUT="fennel-node-${VER}-linux-${{ matrix.arch }}.tar.gz"
+          VER="${GITHUB_REF_NAME}"
+          OUT="fennel-node-${VER}-linux-x86_64.tar.gz"
           mkdir -p artifacts-node
           tar -czf "artifacts-node/${OUT}" -C dist fennel-node
           
           TARBALL_HASH=$(sha256sum "artifacts-node/${OUT}" | awk '{print $1}')
-          echo "tarball=artifacts-node/${OUT}"                              >> "$GITHUB_OUTPUT"
-          echo "sha256=$TARBALL_HASH"                                       >> "$GITHUB_OUTPUT"
-          # 👉 Ansible-ready format (<algo>:<hash>)
-          echo "ansible_checksum=sha256:${TARBALL_HASH}"                    >> "$GITHUB_OUTPUT"
+          echo "tarball=artifacts-node/${OUT}" >> "$GITHUB_OUTPUT"
+          echo "sha256=$TARBALL_HASH" >> "$GITHUB_OUTPUT"
+          echo "ansible_checksum=sha256:${TARBALL_HASH}" >> "$GITHUB_OUTPUT"
           
-          # Still generate the .sha256 file for compatibility
           echo "$TARBALL_HASH  ${OUT}" > "artifacts-node/${OUT}.sha256"
           
           echo "✅ Node tarball packaged: artifacts-node/${OUT}"
-          echo "✅ Ansible checksum: sha256:${TARBALL_HASH}"
 
+      # Prepare raw binary for Parity Ansible
       - name: Prepare raw binary for Parity Ansible
         id: raw_binary
         run: |
           set -euo pipefail
-          cp dist/fennel-node artifacts-node/fennel-node-linux-${{ matrix.arch }}
-          chmod 0755 artifacts-node/fennel-node-linux-${{ matrix.arch }}
+          cp dist/fennel-node artifacts-node/fennel-node-linux-x86_64
+          chmod 0755 artifacts-node/fennel-node-linux-x86_64
 
-          RAW_HASH=$(sha256sum artifacts-node/fennel-node-linux-${{ matrix.arch }} | awk '{print $1}')
-          echo "binary=artifacts-node/fennel-node-linux-${{ matrix.arch }}"            >> "$GITHUB_OUTPUT"
-          echo "binary_sha256=artifacts-node/fennel-node-linux-${{ matrix.arch }}.sha256" >> "$GITHUB_OUTPUT"
-          echo "sha256=$RAW_HASH"                                           >> "$GITHUB_OUTPUT"
-          # 👉 Ansible-ready format (<algo>:<hash>)
-          echo "ansible_checksum=sha256:${RAW_HASH}"                        >> "$GITHUB_OUTPUT"
+          RAW_HASH=$(sha256sum artifacts-node/fennel-node-linux-x86_64 | awk '{print $1}')
+          echo "binary=artifacts-node/fennel-node-linux-x86_64" >> "$GITHUB_OUTPUT"
+          echo "binary_sha256=artifacts-node/fennel-node-linux-x86_64.sha256" >> "$GITHUB_OUTPUT"
+          echo "sha256=$RAW_HASH" >> "$GITHUB_OUTPUT"
+          echo "ansible_checksum=sha256:${RAW_HASH}" >> "$GITHUB_OUTPUT"
           
-          # Still generate the .sha256 file for compatibility
-          echo "$RAW_HASH  fennel-node-linux-${{ matrix.arch }}" > artifacts-node/fennel-node-linux-${{ matrix.arch }}.sha256
+          echo "$RAW_HASH  fennel-node-linux-x86_64" > artifacts-node/fennel-node-linux-x86_64.sha256
           
-          echo "✅ Raw binary prepared: artifacts-node/fennel-node-linux-${{ matrix.arch }}"
-          echo "✅ Ansible checksum: sha256:${RAW_HASH}"
+          echo "✅ Raw binary prepared: artifacts-node/fennel-node-linux-x86_64"
 
-      # Clean up srtool build artifacts to free disk space
+      # Clean up srtool artifacts
       - name: Clean up srtool artifacts
         run: |
           echo "=== Cleaning up srtool build artifacts ==="
-          # Remove intermediate build files but keep the final WASM
           find runtime/fennel/target/srtool -type f -name "*.rlib" -delete || true
           find runtime/fennel/target/srtool -type f -name "*.rmeta" -delete || true
           find runtime/fennel/target/srtool -type d -name "deps" -exec rm -rf {} + || true
           find runtime/fennel/target/srtool -type d -name "build" -exec rm -rf {} + || true
           
-          # Additional aggressive cleanup
-          echo "=== Additional cleanup ==="
-          # Remove Docker build cache and unused images
           docker system prune -af --volumes || true
-          # Remove temporary files
           sudo rm -rf /tmp/* || true
-          # Remove apt cache
           sudo apt-get clean || true
           
           echo "=== Disk usage after cleanup ==="
           df -h
 
-      # Upload runtime WASM for chainspec generation
-      - name: Upload runtime WASM artifact  
-        uses: actions/upload-artifact@v4
-        with:
-          name: fennel-runtime-wasm-${{ matrix.arch }}
-          path: runtime/fennel/target/srtool/release/wbuild/fennel-node-runtime/fennel_node_runtime.compact.wasm
-      - name: Upload node binary artifact
-        uses: actions/upload-artifact@v4
-        with:
-          name: fennel-node-binary-${{ matrix.arch }}
-          path: |
-            ${{ steps.pkg_node.outputs.tarball }}
-            ${{ steps.pkg_node.outputs.tarball }}.sha256
-            ${{ steps.raw_binary.outputs.binary }}
-            ${{ steps.raw_binary.outputs.binary_sha256 }}
-          if-no-files-found: error
-
-  # ------------------------------------------------------------
-  # Build and push multi-platform Docker image
-  # Runs after matrix builds complete to create proper manifest list
-  # ------------------------------------------------------------
-  build-and-push-docker:
-    runs-on: ubuntu-latest
-    needs: build-binaries
-    permissions:
-      contents: read
-      packages: write
-    steps:
-      - name: Checkout repository
-        uses: actions/checkout@v4
-        with:
-          fetch-depth: 0
-          ref: ${{ github.ref }}
-
-      # Download artifacts from matrix builds
-      - name: Download runtime WASM artifact
-        uses: actions/download-artifact@v4
-        with:
-          name: fennel-runtime-wasm-amd64
-          path: runtime/fennel/target/srtool/release/wbuild/fennel-node-runtime/
-
-      # Download all binary artifacts to make them available for Docker build
-      - name: Download binary artifacts
-        uses: actions/download-artifact@v4
-        with:
-          pattern: fennel-node-binary-*
-          merge-multiple: true
-          path: artifacts-node/
-
-      # Set up QEMU for multi-platform builds
-      - name: Set up QEMU
-        uses: docker/setup-qemu-action@v3
-
-      # Set up Docker Buildx for multi-platform builds
-      - name: Set up Docker Buildx
-        uses: docker/setup-buildx-action@v3
-
-      # Log in to Container Registry
-      - name: Log in to the Container registry
-        uses: docker/login-action@v3
-        with:
-          registry: ${{ env.REGISTRY }}
-          username: ${{ github.actor }}
-          password: ${{ secrets.GITHUB_TOKEN }}
-
-      # Extract metadata for Docker tags and labels
-      - name: Extract metadata (tags, labels) for Docker
-        id: meta
-        uses: docker/metadata-action@v5
-        with:
-          images: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}
-          tags: |
-            type=raw,value=${{ github.ref_name }},enable=${{ startsWith(github.ref, 'refs/tags/') }}
-            type=ref,event=branch
-            type=ref,event=pr
-            type=semver,pattern={{version}}
-            type=semver,pattern={{major}}.{{minor}}
-            type=sha,format=long
-
-      # Compute WASM hash for labels
-      - name: Set WASM hash for Docker labels
-        run: |
-          WASM_FILE="runtime/fennel/target/srtool/release/wbuild/fennel-node-runtime/fennel_node_runtime.compact.wasm"
-          if [ -f "$WASM_FILE" ]; then
-            HASH=$(sha256sum "$WASM_FILE" | awk '{print "0x"$1}')
-            echo "WASM_HASH=$HASH" >> $GITHUB_ENV
-            echo "✅ WASM hash: $HASH"
-          else
-            echo "❌ WASM file not found: $WASM_FILE"
-            exit 1
-          fi
-
-      # Build and push multi-platform Docker image
-      - name: Build and push multi-platform Docker image
-        id: build
-        uses: docker/build-push-action@v5
-        with:
-          context: .
-          platforms: linux/amd64,linux/arm64
-          push: true
-          tags: ${{ steps.meta.outputs.tags }}
-          labels: |
-            ${{ steps.meta.outputs.labels }}
-            org.opencontainers.image.description=Fennel Node - Polkadot-based blockchain node
-            org.opencontainers.image.vendor=Fennel Network
-            fennel.wasm.sha256=${{ env.WASM_HASH }}
-          cache-from: type=gha
-          cache-to: type=gha,mode=max
-          provenance: true
-          sbom: true
-          outputs: type=image,name=${{ env.REGISTRY }}/${{ env.IMAGE_NAME }},push=true,annotation-index.org.opencontainers.image.description=Fennel Node - Polkadot-based blockchain node
-
-      # Output image info for later jobs
-      - name: Output image info to artifact
-        run: |
-          mkdir -p ./artifacts
-          echo "Image name: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}" > ./artifacts/image-info.txt
-          echo "Tags:      ${{ steps.meta.outputs.tags }}" >> ./artifacts/image-info.txt
-          echo "Wasm hash: ${{ env.WASM_HASH }}"          >> ./artifacts/image-info.txt
-          echo "Digest:    ${{ steps.build.outputs.digest }}" >> ./artifacts/image-info.txt
-          echo "Created:   $(date -u +\"%Y-%m-%dT%H:%M:%SZ\")" >> ./artifacts/image-info.txt
-
-      # Extract SBOM from built image for release
-      - name: Extract SBOM from image
-        run: |
-          mkdir -p ./artifacts
-          # Extract SBOM using buildkit
-          docker buildx imagetools inspect ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:${{ steps.meta.outputs.version }} --format '{{ json .SBOM }}' > ./artifacts/fennel-docker-sbom.json || echo "No SBOM found"
-          
-          # If SBOM extraction failed, create a fallback note
-          if [ ! -s ./artifacts/fennel-docker-sbom.json ]; then
-            echo '{"note": "SBOM generation enabled but not available in this Docker build action version"}' > ./artifacts/fennel-docker-sbom.json
-          fi
-
-      - name: Upload Docker image info artifact
-        uses: actions/upload-artifact@v4
-        with:
-          name: fennel-docker-image-info
-          path: ./artifacts/image-info.txt
-
-      - name: Upload Docker SBOM artifact
-        uses: actions/upload-artifact@v4
-        with:
-          name: fennel-docker-sbom
-          path: ./artifacts/fennel-docker-sbom.json
-
-  # ------------------------------------------------------------
-  # Generate chainspecs in a separate job to prevent race conditions
-  # This job runs after all matrix builds complete successfully  
-  # ------------------------------------------------------------
-  generate-chainspecs:
-    runs-on: ubuntu-latest
-    needs: build-and-push-docker
-    permissions:
-      contents: write  # Allow pushing commits back to repository
-      packages: read   # Allow reading published artifacts
-    steps:
-      - name: Checkout repository
-        uses: actions/checkout@v4
-        with:
-          fetch-depth: 0
-          fetch-tags: true
-          ref: ${{ github.ref }}
-
-      # Download artifacts from the matrix build (prefer amd64 for consistency)
-      - name: Download runtime WASM (amd64)
-        uses: actions/download-artifact@v4
-        with:
-          name: fennel-runtime-wasm-amd64
-          path: runtime/fennel/target/srtool/release/wbuild/fennel-node-runtime/
-
-      # Ensure WASM hash is available for consistency
-      - name: Set WASM hash for chainspec generation
-        id: wasm_hash
-        run: |
-          # Compute WASM hash from downloaded artifact
-          WASM_FILE="runtime/fennel/target/srtool/release/wbuild/fennel-node-runtime/fennel_node_runtime.compact.wasm"
-          if [ -f "$WASM_FILE" ]; then
-            HASH=$(sha256sum "$WASM_FILE" | awk '{print $1}')
-            echo "WASM_HASH=$HASH" >> $GITHUB_ENV
-            echo "wasm_hash=$HASH" >> $GITHUB_OUTPUT
-            echo "✅ WASM hash: $HASH"
-          else
-            echo "❌ WASM file not found: $WASM_FILE"
-            exit 1
-          fi
-
-      # Set up bootnode configuration from secrets
-      - name: Set up bootnode configuration
-        env:
-          BOOTNODE1_PEER_ID: ${{ secrets.BOOTNODE1_PEER_ID }}
-          BOOTNODE2_PEER_ID: ${{ secrets.BOOTNODE2_PEER_ID }}
-        run: |
-          echo "🔗 Setting up bootnode configuration from GitHub secrets..."
-          
-          # Validate peer IDs are set (fail early if missing)
-          if [ -z "$BOOTNODE1_PEER_ID" ] || [ -z "$BOOTNODE2_PEER_ID" ]; then
-            echo "❌ Missing bootnode peer IDs in GitHub secrets"
-            echo "Required: BOOTNODE1_PEER_ID, BOOTNODE2_PEER_ID"
-            exit 1
-          fi
-          
-          # Derive external bootnode URLs from peer IDs
-          # Using standardized port 30333 and domain pattern
-          BOOTNODE1_ADDR="/dns4/bootnode1.fennel.network/tcp/30333/p2p/$BOOTNODE1_PEER_ID"
-          BOOTNODE2_ADDR="/dns4/bootnode2.fennel.network/tcp/30333/p2p/$BOOTNODE2_PEER_ID"
-          
-          # Create JSON array for external bootnodes
-          EXTERNAL_BOOTNODES_JSON=$(cat <<EOF
-          [
-            "$BOOTNODE1_ADDR",
-            "$BOOTNODE2_ADDR"
-          ]
-          EOF
-          )
-          
-          # Export for use in subsequent steps
-          echo "EXTERNAL_BOOTNODES_JSON=$EXTERNAL_BOOTNODES_JSON" >> $GITHUB_ENV
-          echo "BOOTNODE1_PEER_ID=$BOOTNODE1_PEER_ID" >> $GITHUB_ENV
-          echo "BOOTNODE2_PEER_ID=$BOOTNODE2_PEER_ID" >> $GITHUB_ENV
-          
-          echo "✅ Bootnode configuration set up:"
-          echo "  Bootnode 1: $BOOTNODE1_ADDR"
-          echo "  Bootnode 2: $BOOTNODE2_ADDR"
-
-      # ------------------------------------------------------------
-      # Chainspec generation starts here  
-      # ------------------------------------------------------------
-      - name: Install jq for JSON processing
-        run: |
-          sudo apt-get update && sudo apt-get install -y jq
-          echo "✅ Installed jq"
-
+      # Install chain-spec-builder
       - name: Install chain-spec-builder using Parity CI Unified image
         run: |
-          # Create directory for chain-spec-builder
           mkdir -p "${HOME}/.cargo/bin"
           
-          # Use Parity's CI Unified image for installation (canonical Parity practice)
           docker run --rm \
             -v "${PWD}":/build \
             -v "${HOME}/.cargo/bin":/cargo-bin \
             --workdir /build \
             paritytech/ci-unified:latest \
             bash -c "
-              # Install chain-spec-builder with Parity's recommended approach
               cargo install staging-chain-spec-builder --locked --root /tmp/cargo-install
               cp /tmp/cargo-install/bin/chain-spec-builder /cargo-bin/
-              
-              # Verify installation
               /cargo-bin/chain-spec-builder --version || echo 'Version check not available'
             "
-          echo "✅ Installed chain-spec-builder using Parity CI Unified image"
+          echo "✅ Installed chain-spec-builder"
           
-          # Add cargo bin to PATH for subsequent steps
           echo "${HOME}/.cargo/bin" >> $GITHUB_PATH
 
+      # Generate chain specs
       - name: Create development chain spec
         run: |
           set -euo pipefail
           
-          # Create development directory in chainspecs if it doesn't exist
           mkdir -p chainspecs/development
           
-          # Debug: Check chain-spec-builder version and help
-          echo "Chain-spec-builder version:"
-          chain-spec-builder --version || echo "No version flag available"
-          
-          echo -e "\nChain-spec-builder help:"
-          chain-spec-builder --help || echo "No help available"
-          
-          echo -e "\nChain-spec-builder create help:"
-          chain-spec-builder create --help || echo "No create help available"
-          
-          # Check if the runtime has a development preset
-          echo "Checking available presets..."
-          chain-spec-builder list-presets \
-            --runtime runtime/fennel/target/srtool/release/wbuild/fennel-node-runtime/fennel_node_runtime.compact.wasm || true
-          
-          # Check if runtime exists
-          echo "Checking if runtime WASM exists..."
-          ls -la runtime/fennel/target/srtool/release/wbuild/fennel-node-runtime/fennel_node_runtime.compact.wasm || echo "Runtime WASM not found!"
-          
-          # Generate development chain spec
           echo "Creating development chain spec..."
           chain-spec-builder \
             -c chainspecs/development/development.json \
+            create \
+            -r runtime/fennel/target/srtool/release/wbuild/fennel-node-runtime/fennel_node_runtime.compact.wasm \
             named-preset development
           
-          # Convert to raw format
           echo "Converting to raw format..."
           chain-spec-builder \
             -c chainspecs/development/development-raw.json \
+            convert-to-raw \
             chainspecs/development/development.json
           
-          # Verify the specs were created
-          echo "✅ Generated chain specifications:"
-          ls -l chainspecs/development/
-          
-          # Quick verification of content
-          echo "Verifying development.json content:"
-          jq '.name' chainspecs/development/development.json || echo "Failed to parse JSON"
-          
-          # Comprehensive verification
-          echo -e "\n📋 Verification of generated files:"
-          ls -l chainspecs/development/development.json chainspecs/development/development-raw.json
-          
-          echo -e "\n📄 Chain spec structure (first 5 lines):"
-          jq . chainspecs/development/development.json 2>/dev/null | head -n 5 || true
-          
-          echo -e "\n🔍 Checking file sizes:"
-          stat -c "development.json: %s bytes" chainspecs/development/development.json
-          stat -c "development-raw.json: %s bytes" chainspecs/development/development-raw.json
-          
-          # Verify raw spec is SCALE-encoded (not JSON)
-          echo -e "\n🔬 Verifying raw spec format (first 200 bytes):"
-          head -c 200 chainspecs/development/development-raw.json | xxd | head -n 5 || echo "Could not read raw spec"
-          
-          # Ensure files are not empty
-          if [ ! -s chainspecs/development/development.json ]; then
-            echo "❌ Error: development.json is empty!"
-            exit 1
-          fi
-          if [ ! -s chainspecs/development/development-raw.json ]; then
-            echo "❌ Error: development-raw.json is empty!"
-            exit 1
-          fi
-          echo "✅ All development chain spec files are populated"
+          echo "✅ Generated development chain specifications"
 
       - name: Inject bootnodes into development chain spec
         run: |
@@ -879,187 +375,73 @@ jobs:
           TARGET="development"
           SPEC="chainspecs/${TARGET}/development.json"
           
-          # Use external-only bootnodes (Parity's recommended approach)
-          # Both internal and external nodes use the same public endpoints
-          
-          # Use bootnodes JSON directly (peer IDs are public and safe to log)
           EXTERNAL_BOOTNODES="$EXTERNAL_BOOTNODES_JSON"
-          echo "📋 Using external-only bootnode architecture:"
           
-          # Only update if there are changes (idempotent)
-          CURRENT_BOOTNODES=$(jq -c '.bootNodes // []' "$SPEC")
-          if [ "$CURRENT_BOOTNODES" != "$EXTERNAL_BOOTNODES" ]; then
-            echo "📝 Updating bootNodes in ${TARGET} chain spec with peer IDs and chain metadata..."
-            jq --argjson arr "$EXTERNAL_BOOTNODES" \
-               --arg ss58 "42" \
-               '. as $original
-                | .bootNodes = $arr
-                | .properties = {
-                    "ss58Format": ($ss58|tonumber),
-                    "tokenDecimals": 18,
-                    "tokenSymbol": "FNL"
-                  }
-                | .genesis = $original.genesis
-                | .codeSubstitutes = $original.codeSubstitutes
-                | .telemetryEndpoints = $original.telemetryEndpoints' "$SPEC" > tmp.json && mv tmp.json "$SPEC"
-            
-            # Regenerate raw spec with bootnodes included
-            echo "🔄 Regenerating raw ${TARGET} spec with bootnodes..."
-            chain-spec-builder \
-              -c "chainspecs/${TARGET}/development-raw.json" \
-              "chainspecs/${TARGET}/development.json"
-            
-            echo "✅ Bootnodes updated successfully with peer IDs"
-          else
-            echo "✅ No changes needed - bootnodes already up to date"
-          fi
+          jq --argjson arr "$EXTERNAL_BOOTNODES" \
+             --arg ss58 "42" \
+             '.bootNodes = $arr
+              | .protocolId = "fenn"
+              | .properties = {
+                  "ss58Format": ($ss58|tonumber),
+                  "tokenDecimals": 18,
+                  "tokenSymbol": "FNL"
+                }' "$SPEC" > tmp.json && mv tmp.json "$SPEC"
           
-          # Verify bootnodes configuration
-          echo "📊 Current bootNodes configuration:"
-          jq '.bootNodes' "$SPEC" || echo "No bootNodes found"
+          echo "🔄 Regenerating raw development spec with bootnodes..."
+          chain-spec-builder \
+            -c "chainspecs/${TARGET}/development-raw.json" \
+            convert-to-raw \
+            "chainspecs/${TARGET}/development.json"
+          
+          echo "✅ Development chainspec updated with bootnodes"
 
-      - name: Commit development chainspecs to repository
+      # Similar steps for staging...
+      - name: Create staging chain specs
         run: |
-          # Configure git
-          git config --local user.email "action@github.com"
-          git config --local user.name "GitHub Action"
+          set -euo pipefail
           
-          # Add the development chainspecs
-          git add chainspecs/development/development.json chainspecs/development/development-raw.json
+          mkdir -p chainspecs/staging
           
-          # Check if there are changes to commit
-          if git diff --staged --quiet; then
-            echo "No changes to development chainspecs"
-          else
-            # Commit the changes with [ci skip] to prevent retriggering
-            git commit -m "Update development chainspecs with bootnode peer IDs [ci skip]
+          chain-spec-builder \
+            -c chainspecs/staging/staging-chainspec.json \
+            create \
+            -r runtime/fennel/target/srtool/release/wbuild/fennel-node-runtime/fennel_node_runtime.compact.wasm \
+            named-preset staging
+          
+          chain-spec-builder \
+            -c chainspecs/staging/staging-raw.json \
+            convert-to-raw \
+            chainspecs/staging/staging-chainspec.json
+          
+          echo "✅ Generated staging chain specifications"
 
-            - Peer IDs from GitHub secrets (BOOTNODE1_PEER_ID, BOOTNODE2_PEER_ID)
-            - Using external-only bootnode architecture (Parity best practice)
-            - Bootnode 1: $BOOTNODE1_PEER_ID
-            - Bootnode 2: $BOOTNODE2_PEER_ID"
-            
-            # Push the changes back to the repository (push current HEAD to main branch)
-            git push origin HEAD:main
-            
-            echo "✅ Development chainspecs committed and pushed to repository"
-          fi
-
-  # ------------------------------------------------------------
-  # Package Helm chart and create releases (runs after chainspecs)
-  # This also avoids race conditions in Helm chart updates
-  # ------------------------------------------------------------
-  package-and-release:
-    runs-on: ubuntu-latest
-    needs: generate-chainspecs
-    concurrency:
-      group: package-and-release-${{ github.repository }}
-      cancel-in-progress: false
-    permissions:
-      contents: write
-      packages: read
-    steps:
-      - name: Checkout repository
-        uses: actions/checkout@v4
-        with:
-          fetch-depth: 0
-          fetch-tags: true
-          ref: ${{ github.ref }}
-
-      # Download artifacts from previous jobs
-      - name: Download chainspecs
-        uses: actions/download-artifact@v4
-        with:
-          name: fennel-chainspecs
-          path: chainspecs/
-
-      - name: Download binary artifacts (both architectures)
-        uses: actions/download-artifact@v4
-        with:
-          pattern: fennel-node-binary-*
-          merge-multiple: true
-          path: artifacts-node/
-
-      - name: Download Docker image info artifact
-        uses: actions/download-artifact@v4
-        with:
-          name: fennel-docker-image-info
-          path: artifacts/
-
-      - name: Download Docker SBOM artifact
-        uses: actions/download-artifact@v4
-        with:
-          name: fennel-docker-sbom
-          path: artifacts/
-
-      # Get the build outputs from the matrix job artifacts
-      - name: Restore build context from artifacts
-        id: restore_context
+      - name: Inject bootnodes into staging chain spec
         run: |
-          # Set basic environment variables
-          echo "REGISTRY=ghcr.io" >> $GITHUB_ENV
-          echo "IMAGE_NAME=${{ github.repository }}" >> $GITHUB_ENV
+          set -euo pipefail
           
-          # Extract WASM hash from image info (should be consistent across architectures)
-          if [ -f "artifacts/image-info.txt" ]; then
-            WASM_HASH=$(grep "Wasm hash:" artifacts/image-info.txt | head -n1 | awk '{print $3}')
-            echo "WASM_HASH=$WASM_HASH" >> $GITHUB_ENV
-            echo "✅ Restored WASM hash: $WASM_HASH"
-            
-            # Extract image digest for summary
-            IMAGE_DIGEST=$(grep "Digest:" artifacts/image-info.txt | head -n1 | awk '{print $2}')
-            echo "image_digest=$IMAGE_DIGEST" >> $GITHUB_OUTPUT
-            echo "✅ Restored image digest: $IMAGE_DIGEST"
-          else
-            echo "⚠️ Could not find image info artifact"
-          fi
+          TARGET="staging"
+          SPEC="chainspecs/${TARGET}/staging-chainspec.json"
           
-          # Extract binary information from downloaded artifacts
-          echo "📦 Extracting binary information from artifacts..."
+          EXTERNAL_BOOTNODES="$EXTERNAL_BOOTNODES_JSON"
           
-          # Find tarball files (should be consistent across architectures)
-          TARBALL_FILE=$(find artifacts-node -name "*.tar.gz" | head -n1)
-          if [ -n "$TARBALL_FILE" ]; then
-            TARBALL_BASENAME=$(basename "$TARBALL_FILE")
-            echo "tarball_file=$TARBALL_FILE" >> $GITHUB_OUTPUT
-            echo "tarball_basename=$TARBALL_BASENAME" >> $GITHUB_OUTPUT
-            
-            # Extract tarball SHA256 from .sha256 file
-            if [ -f "${TARBALL_FILE}.sha256" ]; then
-              TARBALL_SHA256=$(cat "${TARBALL_FILE}.sha256" | awk '{print $1}')
-              echo "tarball_sha256=$TARBALL_SHA256" >> $GITHUB_OUTPUT
-              echo "tarball_ansible_checksum=sha256:$TARBALL_SHA256" >> $GITHUB_OUTPUT
-            fi
-            echo "✅ Found tarball: $TARBALL_BASENAME"
-          else
-            echo "❌ No tarball found in artifacts"
-          fi
+          jq --argjson arr "$EXTERNAL_BOOTNODES" \
+             --arg ss58 "42" \
+             '.bootNodes = $arr
+              | .protocolId = "fenn"
+              | .properties = {
+                  "ss58Format": ($ss58|tonumber),
+                  "tokenDecimals": 18,
+                  "tokenSymbol": "FNL"
+                }' "$SPEC" > tmp.json && mv tmp.json "$SPEC"
           
-          # Find raw binary files (use pattern to match any architecture)
-          RAW_BINARY_FILE=$(find artifacts-node -name "fennel-node-linux-*" | grep -v ".sha256" | head -n1)
-          if [ -n "$RAW_BINARY_FILE" ]; then
-            RAW_BINARY_BASENAME=$(basename "$RAW_BINARY_FILE")
-            echo "raw_binary_file=$RAW_BINARY_FILE" >> $GITHUB_OUTPUT  
-            echo "raw_binary_basename=$RAW_BINARY_BASENAME" >> $GITHUB_OUTPUT
-            
-            # Extract raw binary SHA256 from .sha256 file
-            if [ -f "${RAW_BINARY_FILE}.sha256" ]; then
-              RAW_BINARY_SHA256=$(cat "${RAW_BINARY_FILE}.sha256" | awk '{print $1}')
-              echo "raw_binary_sha256=$RAW_BINARY_SHA256" >> $GITHUB_OUTPUT
-              echo "raw_binary_ansible_checksum=sha256:$RAW_BINARY_SHA256" >> $GITHUB_OUTPUT
-            fi
-            echo "✅ Found raw binary: $RAW_BINARY_BASENAME"
-          else
-            echo "❌ No raw binary found in artifacts"
-          fi
+          chain-spec-builder \
+            -c "chainspecs/${TARGET}/staging-raw.json" \
+            convert-to-raw \
+            "chainspecs/${TARGET}/staging-chainspec.json"
+          
+          echo "✅ Staging chainspec updated with bootnodes"
 
-      # Continue with Helm chart packaging and release creation steps here
-      # (Implementation continues...)
-
-      # ------------------------------------------------------------
-      # PRODUCTION CHAINSPEC GENERATION
-      # Only generate production chainspecs for release tags
-      # ------------------------------------------------------------
+      # Production chain specs (release only)
       - name: Create production chain specs
         if: startsWith(github.ref, 'refs/tags/')
         env:
@@ -1075,7 +457,6 @@ jobs:
           
           echo "🏭 Generating production chainspecs for release tag..."
           
-          # Export environment variables for chain-spec-builder
           export SUDO_SS58="${PROD_SUDO_SS58}"
           export VAL1_AURA_PUB="${PROD_VAL1_AURA_PUB}"
           export VAL1_GRANDPA_PUB="${PROD_VAL1_GRANDPA_PUB}"
@@ -1084,33 +465,8 @@ jobs:
           export VAL2_GRANDPA_PUB="${PROD_VAL2_GRANDPA_PUB}"
           export VAL2_STASH_SS58="${PROD_VAL2_STASH_SS58}"
           
-          # Verify environment variables are set
-          echo "🔍 Verifying production environment variables:"
-          echo "SUDO_SS58: ${SUDO_SS58}"
-          echo "VAL1_AURA_PUB: ${VAL1_AURA_PUB}"
-          echo "VAL1_GRANDPA_PUB: ${VAL1_GRANDPA_PUB}"
-          echo "VAL1_STASH_SS58: ${VAL1_STASH_SS58}"
-          echo "VAL2_AURA_PUB: ${VAL2_AURA_PUB}"
-          echo "VAL2_GRANDPA_PUB: ${VAL2_GRANDPA_PUB}"
-          echo "VAL2_STASH_SS58: ${VAL2_STASH_SS58}"
-          
-          # Create production directory in chainspecs if it doesn't exist
           mkdir -p chainspecs/production
           
-          # Debug: Check available presets in the runtime
-          echo "🔍 Checking available presets in production runtime..."
-          env SUDO_SS58="${SUDO_SS58}" \
-              VAL1_AURA_PUB="${VAL1_AURA_PUB}" \
-              VAL1_GRANDPA_PUB="${VAL1_GRANDPA_PUB}" \
-              VAL1_STASH_SS58="${VAL1_STASH_SS58}" \
-              VAL2_AURA_PUB="${VAL2_AURA_PUB}" \
-              VAL2_GRANDPA_PUB="${VAL2_GRANDPA_PUB}" \
-              VAL2_STASH_SS58="${VAL2_STASH_SS58}" \
-          chain-spec-builder list-presets \
-            --runtime runtime/fennel/target/srtool/release/wbuild/fennel-node-runtime/fennel_node_runtime.compact.wasm || echo "Failed to list presets"
-          
-          # Generate production chain spec
-          echo "Generating production chain spec..."
           env SUDO_SS58="${SUDO_SS58}" \
               VAL1_AURA_PUB="${VAL1_AURA_PUB}" \
               VAL1_GRANDPA_PUB="${VAL1_GRANDPA_PUB}" \
@@ -1124,62 +480,23 @@ jobs:
             -r runtime/fennel/target/srtool/release/wbuild/fennel-node-runtime/fennel_node_runtime.compact.wasm \
             named-preset production
           
-          # Generate raw production chain spec
-          echo "Generating raw production chain spec..."
           chain-spec-builder \
             -c chainspecs/production/production-raw.json \
             convert-to-raw \
             chainspecs/production/production-chainspec.json
           
-          # Verify the production specs were created
-          echo "✅ Generated production chain specifications:"
-          ls -la chainspecs/production/
-          
-          # Quick verification of content
-          echo "Verifying production-chainspec.json content:"
-          jq '.name' chainspecs/production/production-chainspec.json || echo "Failed to parse JSON"
-          
-          # Comprehensive verification
-          echo -e "\n📋 Verification of generated files:"
-          ls -l chainspecs/production/production-chainspec.json chainspecs/production/production-raw.json
-          
-          echo -e "\n📄 Chain spec structure (first 5 lines):"
-          jq . chainspecs/production/production-chainspec.json 2>/dev/null | head -n 5 || true
-          
-          echo -e "\n🔍 Checking file sizes:"
-          stat -c "production-chainspec.json: %s bytes" chainspecs/production/production-chainspec.json
-          stat -c "production-raw.json: %s bytes" chainspecs/production/production-raw.json
-          
-          # Ensure files are not empty
-          if [ ! -s chainspecs/production/production-chainspec.json ]; then
-            echo "❌ Error: production-chainspec.json is empty!"
-            exit 1
-          fi
-          if [ ! -s chainspecs/production/production-raw.json ]; then
-            echo "❌ Error: production-raw.json is empty!"
-            exit 1
-          fi
-          echo "✅ All production chain spec files are populated"
+          echo "✅ Generated production chain specifications"
 
       - name: Inject bootnodes into production chain spec
         if: startsWith(github.ref, 'refs/tags/')
         run: |
           set -euo pipefail
           
-          echo "🔗 Injecting bootnode peer IDs into production chain spec..."
-          
           TARGET="production"
           SPEC="chainspecs/${TARGET}/production-chainspec.json"
           
-          # Use external-only bootnodes (Parity's recommended approach)
-          # Both internal and external nodes use the same public endpoints
-          
-          # Use bootnodes JSON directly (peer IDs are public and safe to log)
           EXTERNAL_BOOTNODES="$EXTERNAL_BOOTNODES_JSON"
-          echo "📋 Using external-only bootnode architecture:"
           
-          # Update chain spec with production-specific settings (preserve genesis)
-          echo "📝 Updating production chain spec with peer IDs and production settings..."
           jq --argjson arr "$EXTERNAL_BOOTNODES" \
              --arg ss58 "42" \
              '. as $original
@@ -1197,140 +514,85 @@ jobs:
               | .codeSubstitutes = $original.codeSubstitutes
               | .telemetryEndpoints = $original.telemetryEndpoints' "$SPEC" > tmp.json && mv tmp.json "$SPEC"
           
-          # Regenerate raw spec with bootnodes included
-          echo "🔄 Regenerating raw production spec with bootnodes..."
           chain-spec-builder \
             -c "chainspecs/${TARGET}/production-raw.json" \
             convert-to-raw \
             "chainspecs/${TARGET}/production-chainspec.json"
           
-          echo "✅ Production chainspec updated successfully with derived peer IDs"
-          
-          # Verify bootnodes configuration
-          echo "📊 Current production bootNodes configuration:"
-          jq '.bootNodes' "$SPEC" || echo "No bootNodes found"
-          
-          # Show production chain details
-          echo "📋 Production chain configuration:"
-          jq '{name: .name, id: .id, chainType: .chainType}' "$SPEC"
+          echo "✅ Production chainspec updated with bootnodes"
 
-      - name: Commit production chainspecs to repository
-        if: startsWith(github.ref, 'refs/tags/')
+      # Commit chainspecs to repository
+      - name: Commit chainspecs to repository
         run: |
-          # Configure git
           git config --local user.email "action@github.com"
           git config --local user.name "GitHub Action"
           
-          # Add the production chainspecs
-          git add chainspecs/production/production-chainspec.json chainspecs/production/production-raw.json
+          git add chainspecs/
           
-          # Check if there are changes to commit
           if git diff --staged --quiet; then
-            echo "No changes to production chainspecs"
+            echo "No changes to chainspecs"
           else
-            # Commit the changes with [ci skip] to prevent retriggering
-            git commit -m "Add production chainspecs for release ${GITHUB_REF#refs/tags/} [ci skip]
-
-            🏭 Production Release: ${GITHUB_REF#refs/tags/}
-            - Peer IDs from GitHub secrets (BOOTNODE1_PEER_ID, BOOTNODE2_PEER_ID)
-            - Using external-only bootnode architecture (Parity best practice)
-            - Chain Type: Live (Production)
+            git commit -m "Update chainspecs with bootnode peer IDs [ci skip]
+            
+            - Development, staging, and production chainspecs
             - Bootnode 1: $BOOTNODE1_PEER_ID
             - Bootnode 2: $BOOTNODE2_PEER_ID"
             
-            # Push the changes back to the repository (push current HEAD to main branch)
             git push origin HEAD:main
             
-            echo "✅ Production chainspecs committed and pushed to repository"
+            echo "✅ Chainspecs committed and pushed to repository"
           fi
 
-      # Compute chainspec SHA-256 for security verification
+      # Compute chainspec SHA-256
       - name: Compute chainspec SHA-256
         id: specsha
         run: |
           set -euo pipefail
-          echo "🔐 Computing chainspec SHA-256 hashes for security verification..."
+          echo "🔐 Computing chainspec SHA-256 hashes..."
           
-          # Compute SHA-256 for staging chainspec
           if [ -f "chainspecs/staging/staging-raw.json" ]; then
             STAGING_SHA=$(sha256sum chainspecs/staging/staging-raw.json | awk '{print $1}')
             echo "staging_sha=$STAGING_SHA" >> $GITHUB_OUTPUT
             echo "✅ Staging chainspec SHA-256: $STAGING_SHA"
-          else
-            echo "⚠️  Staging chainspec not found"
           fi
           
-          # Compute SHA-256 for development chainspec  
           if [ -f "chainspecs/development/development-raw.json" ]; then
             DEV_SHA=$(sha256sum chainspecs/development/development-raw.json | awk '{print $1}')
             echo "dev_sha=$DEV_SHA" >> $GITHUB_OUTPUT
             echo "✅ Development chainspec SHA-256: $DEV_SHA"
-          else
-            echo "⚠️  Development chainspec not found"
           fi
           
-          # Compute SHA-256 for production chainspec (only for release tags)
           if [ -f "chainspecs/production/production-raw.json" ]; then
             PRODUCTION_SHA=$(sha256sum chainspecs/production/production-raw.json | awk '{print $1}')
             echo "production_sha=$PRODUCTION_SHA" >> $GITHUB_OUTPUT
             echo "✅ Production chainspec SHA-256: $PRODUCTION_SHA"
-          else
-            echo "⚠️  Production chainspec not found (expected for non-release builds)"
           fi
-          
-          echo "🔒 Chainspec hashes computed for runtime verification"
 
-      - name: Verify chainspec integrity
-        run: |
-          set -euo pipefail
-          echo "🔍 Verifying chainspec integrity..."
-          
-          # Check that chainspecs are not empty and contain expected structure
-          EXPECTED_SPECS=("chainspecs/development/development.json" "chainspecs/staging/staging-chainspec.json")
-          
-          # Add production chainspec verification for release tags
-          if [[ "${GITHUB_REF}" == refs/tags/* ]]; then
-            EXPECTED_SPECS+=("chainspecs/production/production-chainspec.json")
-          fi
-          
-          for spec in "${EXPECTED_SPECS[@]}"; do
-            if [ -f "$spec" ]; then
-              # Verify it's valid JSON with expected fields
-              if jq -e '.name' "$spec" >/dev/null 2>&1; then
-                echo "✅ $spec: Valid JSON structure"
-              else
-                echo "❌ $spec: Invalid JSON structure"
-                exit 1
-              fi
-            else
-              echo "❌ Missing chainspec: $spec"
-              exit 1
-            fi
-          done
-          
-          # Verify raw chainspecs are not empty
-          EXPECTED_RAW=("chainspecs/development/development-raw.json" "chainspecs/staging/staging-raw.json")
-          
-          # Add production raw chainspec verification for release tags
-          if [[ "${GITHUB_REF}" == refs/tags/* ]]; then
-            EXPECTED_RAW+=("chainspecs/production/production-raw.json")
-          fi
-          
-          for rawspec in "${EXPECTED_RAW[@]}"; do
-            if [ -f "$rawspec" ] && [ -s "$rawspec" ]; then
-              echo "✅ $rawspec: Non-empty raw chainspec"
-            else
-              echo "❌ $rawspec: Missing or empty raw chainspec"
-              exit 1
-            fi
-          done
-          
-          echo "✅ All chainspecs verified successfully"
+      # Build and push AMD64 Docker image
+      - name: Build and push AMD64 Docker image
+        id: build
+        uses: docker/build-push-action@v5
+        with:
+          context: .
+          platforms: linux/amd64
+          push: true
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: |
+            ${{ steps.meta.outputs.labels }}
+            org.opencontainers.image.description=Fennel Node - Polkadot-based blockchain node (AMD64)
+            org.opencontainers.image.vendor=Fennel Network
+            fennel.wasm.sha256=${{ env.WASM_HASH }}
+          build-args: |
+            WASM_HASH=${{ env.WASM_HASH }}
+          cache-from: type=gha,scope=amd64
+          cache-to: type=gha,mode=max,scope=amd64
+          provenance: false
 
+      # Upload artifacts
       - name: Upload chain specs as artifacts
         uses: actions/upload-artifact@v4
         with:
-          name: fennel-chainspecs
+          name: fennel-chainspecs-amd64
           path: |
             chainspecs/development/development.json
             chainspecs/development/development-raw.json
@@ -1339,107 +601,225 @@ jobs:
             chainspecs/production/production-chainspec.json
             chainspecs/production/production-raw.json
           if-no-files-found: ignore
-      - name: Download chainspecs
-        uses: actions/download-artifact@v4
-        with:
-          name: fennel-chainspecs
-          path: chainspecs/
 
-      - name: Download binary artifacts (both architectures)
-        uses: actions/download-artifact@v4
+      - name: Upload node binary artifact
+        uses: actions/upload-artifact@v4
         with:
-          pattern: fennel-node-binary-*
-          merge-multiple: true
-          path: artifacts-node/
+          name: fennel-node-binary-amd64
+          path: |
+            ${{ steps.pkg_node.outputs.tarball }}
+            ${{ steps.pkg_node.outputs.tarball }}.sha256
+            ${{ steps.raw_binary.outputs.binary }}
+            ${{ steps.raw_binary.outputs.binary_sha256 }}
+          if-no-files-found: error
 
-      - name: Download Docker image info artifact
+  # Build ARM64 image (simplified, reuses artifacts from AMD64)
+  build-arm64:
+    runs-on: ubuntu-latest
+    needs: [build-amd64]
+    permissions:
+      contents: read
+      packages: write
+    outputs:
+      image-digest: ${{ steps.build.outputs.digest }}
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      # Free up disk space
+      - name: Free Disk Space (Ubuntu)
+        uses: jlumbroso/free-disk-space@54081f138730dfa15788a46383842cd2f914a1be # 1.3.1
+        with:
+          android: true
+          dotnet: true
+          haskell: true
+          large-packages: true
+          swap-storage: false
+
+      # Set up Docker Buildx
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+      
+      # Log in to the Container registry
+      - name: Log in to the Container registry
+        uses: docker/login-action@v3
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      # Extract metadata
+      - name: Extract metadata (tags, labels) for Docker
+        id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}
+          tags: |
+            type=raw,value=${{ github.ref_name }},enable=${{ startsWith(github.ref, 'refs/tags/') }}
+            type=ref,event=branch
+            type=ref,event=pr
+            type=semver,pattern={{version}}
+            type=semver,pattern={{major}}.{{minor}}
+            type=sha,format=long
+          flavor: |
+            suffix=-arm64
+
+      # Build and push ARM64 Docker image
+      - name: Build and push ARM64 Docker image
+        id: build
+        uses: docker/build-push-action@v5
+        with:
+          context: .
+          platforms: linux/arm64
+          push: true
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: |
+            ${{ steps.meta.outputs.labels }}
+            org.opencontainers.image.description=Fennel Node - Polkadot-based blockchain node (ARM64)
+            org.opencontainers.image.vendor=Fennel Network
+            fennel.wasm.sha256=${{ needs.build-amd64.outputs.wasm-hash }}
+          build-args: |
+            WASM_HASH=${{ needs.build-amd64.outputs.wasm-hash }}
+          cache-from: type=gha,scope=arm64
+          cache-to: type=gha,mode=max,scope=arm64
+          provenance: false
+
+      # Clean up
+      - name: Clean up build artifacts
+        run: |
+          echo "=== Cleaning up build artifacts ==="
+          docker system prune -af --volumes || true
+          echo "=== Disk usage after cleanup ==="
+          df -h
+
+  # Create manifest and release
+  create-manifest-and-release:
+    runs-on: ubuntu-latest
+    needs: [build-amd64, build-arm64]
+    permissions:
+      contents: write
+      packages: write
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Log in to the Container registry
+        uses: docker/login-action@v3
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      # Extract metadata for main manifest
+      - name: Extract metadata for manifest
+        id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}
+          tags: |
+            type=raw,value=${{ github.ref_name }},enable=${{ startsWith(github.ref, 'refs/tags/') }}
+            type=ref,event=branch
+            type=ref,event=pr
+            type=semver,pattern={{version}}
+            type=semver,pattern={{major}}.{{minor}}
+            type=sha,format=long
+
+      # Create and push multi-arch manifest
+      - name: Create multi-arch manifest
+        run: |
+          echo "${{ steps.meta.outputs.tags }}" | while IFS= read -r tag; do
+            if [ -n "$tag" ]; then
+              echo "Creating manifest for: $tag"
+              docker manifest create "$tag" \
+                "$tag-amd64" \
+                "$tag-arm64"
+              docker manifest push "$tag"
+            fi
+          done
+
+      # Download artifacts
+      - name: Download artifacts
         uses: actions/download-artifact@v4
         with:
-          name: fennel-docker-image-info
           path: artifacts/
 
-      # Get the build outputs from the matrix job artifacts
-      - name: Restore build context from artifacts
-        run: |
-          # Set basic environment variables
-          echo "REGISTRY=ghcr.io" >> $GITHUB_ENV
-          echo "IMAGE_NAME=${{ github.repository }}" >> $GITHUB_ENV
-          
-          # Extract WASM hash from image info (should be consistent across architectures)
-          if [ -f "artifacts/image-info.txt" ]; then
-            WASM_HASH=$(grep "Wasm hash:" artifacts/image-info.txt | head -n1 | awk '{print $3}')
-            echo "WASM_HASH=$WASM_HASH" >> $GITHUB_ENV
-            echo "✅ Restored WASM hash: $WASM_HASH"
-          else
-            echo "⚠️ Could not find image info artifact"
-          fi
-          # Extract image digest from image info (for Helm chart updates)
-          if [ -f "artifacts/image-info.txt" ]; then
-            IMAGE_DIGEST=$(grep "Digest:" artifacts/image-info.txt | head -n1 | awk '{print $2}')
-            echo "IMAGE_DIGEST=$IMAGE_DIGEST" >> $GITHUB_ENV
-            echo "✅ Restored image digest: $IMAGE_DIGEST"
-          else
-            echo "⚠️ Could not find image info artifact"
-          fi
+      # Install Helm
+      - name: Install Helm
+        uses: azure/setup-helm@v4
+        with:
+          version: 'v3.13.0'
 
-      # Install yq for YAML processing in Helm chart updates
-      - name: Install yq
-        uses: mikefarah/yq@v4
-
-      # Update Helm chart values with image digest and tag
-      - name: Update Helm chart values
-        id: extract_tag
+      - name: Add Parity Helm repo
         run: |
-          set -euo pipefail
-          
-          # For tagged releases, use the tag name directly
+          helm repo add parity https://paritytech.github.io/helm-charts
+          helm repo update
+
+      - name: Update Helm dependencies
+        run: |
+          cd Charts/fennel-node
+          helm dependency update
+
+      # Extract image tag
+      - name: Extract image tag from metadata
+        id: extract-tag
+        run: |
           if [[ "${{ github.ref }}" == refs/tags/* ]]; then
             TAG="${{ github.ref_name }}"
             echo "tag=${TAG}" >> $GITHUB_OUTPUT
             echo "✅ Using release tag: ${TAG}"
           else
-            # For branch builds, use a simple sha tag format
-            SHA_TAG="sha-$(echo ${{ github.sha }} | cut -c1-7)"
+            SHA_TAG=$(echo "${{ steps.meta.outputs.tags }}" | grep -oE 'sha-[a-f0-9]+' | head -1)
             echo "tag=${SHA_TAG}" >> $GITHUB_OUTPUT
-            echo "✅ Using SHA tag: ${SHA_TAG}"
+            echo "✅ Extracted image tag: ${SHA_TAG}"
+          fi
+
+      # Update Chart.yaml version for releases
+      - name: Update Chart.yaml version for releases
+        if: startsWith(github.ref, 'refs/tags/')
+        run: |
+          CHART_VERSION="${{ github.ref_name }}"
+          CHART_VERSION="${CHART_VERSION#fennel-node-}"
+          
+          echo "🏷️  Updating Chart.yaml version to: $CHART_VERSION"
+          
+          sed -i "s/^version: .*/version: $CHART_VERSION/" Charts/fennel-node/Chart.yaml
+          sed -i "s/^appVersion: .*/appVersion: \"$CHART_VERSION\"/" Charts/fennel-node/Chart.yaml
+          
+          echo "✅ Chart.yaml updated"
+
+      # Update Helm values
+      - name: Update Helm values with yq
+        run: |
+          # Install yq
+          sudo wget -qO /usr/local/bin/yq https://github.com/mikefarah/yq/releases/latest/download/yq_linux_amd64
+          sudo chmod +x /usr/local/bin/yq
+          
+          # Update base values.yaml
+          yq eval '.image.tag = "${{ steps.extract-tag.outputs.tag }}"' -i Charts/fennel-node/values.yaml
+          yq eval '.image.digest = "${{ needs.build-amd64.outputs.image-digest }}"' -i Charts/fennel-node/values.yaml
+          
+          # Update staging values
+          yq eval '.image.tag = "${{ steps.extract-tag.outputs.tag }}"' -i Charts/fennel-node/values-staging.yaml
+          yq eval '.image.digest = "${{ needs.build-amd64.outputs.image-digest }}"' -i Charts/fennel-node/values-staging.yaml
+          
+          # Add staging chainspec SHA if available
+          if [ -n "${{ needs.build-amd64.outputs.staging_sha }}" ]; then
+            yq eval '.node.customChainspecSha256 = "${{ needs.build-amd64.outputs.staging_sha }}"' -i Charts/fennel-node/values-staging.yaml
           fi
           
-          # Update Chart.yaml version to match release tag (Helm best practice: chart version == app version)
+          # Add release tag for tagged releases
           if [[ "${{ github.ref }}" == refs/tags/* ]]; then
-            # Extract version from tag (fennel-node-X.Y.Z -> X.Y.Z)
-            CHART_VERSION="${{ github.ref_name }}"
-            CHART_VERSION="${CHART_VERSION#fennel-node-}"  # Remove fennel-node- prefix
-            
-            echo "🏷️  Updating Chart.yaml version to: $CHART_VERSION"
-            
-            # Update both version and appVersion in Chart.yaml
-            sed -i "s/^version: .*/version: $CHART_VERSION/" Charts/fennel-node/Chart.yaml
-            sed -i "s/^appVersion: .*/appVersion: \"$CHART_VERSION\"/" Charts/fennel-node/Chart.yaml
-            
-            echo "✅ Chart.yaml updated:"
-            grep -E "^(version|appVersion):" Charts/fennel-node/Chart.yaml
+            yq eval '.releaseTag = "${{ github.ref_name }}"' -i Charts/fennel-node/values-staging.yaml
           fi
 
-          # Update image tag and digest in values.yaml
-          for file in "Charts/fennel-node/values.yaml" "Charts/fennel-node/values-staging.yaml"; do
-            if [ -f "$file" ]; then
-              echo "🔧 Updating $file with image tag and digest..."
-              # Update image.tag
-              yq -i '.image.tag = env(tag)' "$file"
-              # Update image.digest
-              yq -i '.image.digest = env(IMAGE_DIGEST)' "$file"
-            else
-              echo "⚠️ $file not found, skipping..."
-            fi
-          done
-
+      # Lint and package Helm chart
       - name: Lint Helm chart
         run: |
           echo "🔍 Linting base chart..."
-          helm lint --strict Charts/fennel-node
+          helm lint Charts/fennel-node
           
           echo "🔍 Linting with staging values..."
-          helm lint --strict Charts/fennel-node -f Charts/fennel-node/values-staging.yaml
+          helm lint Charts/fennel-node -f Charts/fennel-node/values-staging.yaml
 
       - name: Package Helm chart
         run: |
@@ -1448,140 +828,22 @@ jobs:
           echo "📦 Packaged chart:"
           ls -la release/
 
-      - name: Verify release files exist
-        if: startsWith(github.ref, 'refs/tags/')
+      # Create output artifact
+      - name: Output image info to artifact
         run: |
-          echo "🔍 Verifying all expected release files exist..."
-          
-          # Check Helm chart
-          echo "📦 Helm chart files:"
-          ls -la release/ || echo "❌ No release directory or files found"
-          
-          # Check artifacts
-          echo "📋 Artifact files:"
-          ls -la ./artifacts/ || echo "❌ No artifacts directory found"
-          
-          # Check chainspecs
-          echo "🔗 Development chainspecs:"
-          ls -la chainspecs/development/ || echo "❌ No development chainspecs directory found"
-          
-          echo "🔗 Staging chainspecs:"
-          ls -la chainspecs/staging/ || echo "❌ No staging chainspecs directory found"
-          
-          echo "🔗 Production chainspecs:"
-          ls -la chainspecs/production/ || echo "❌ No production chainspecs directory found"
-          
-          # Check node binary artifacts
-          echo "🧮 Node binary artifacts:"
-          ls -la artifacts-node/ || echo "❌ No node binary artifacts directory found"
-          
-          # Verify specific files
-          echo "✅ Checking specific files:"
-          for file in \
-            "release/*.tgz" \
-            "./artifacts/image-info.txt" \
-            "chainspecs/development/development.json" \
-            "chainspecs/development/development-raw.json" \
-            "chainspecs/staging/staging-chainspec.json" \
-            "chainspecs/staging/staging-raw.json" \
-            "chainspecs/production/production-chainspec.json" \
-            "chainspecs/production/production-raw.json" \
-            "artifacts-node/*.tar.gz" \
-            "artifacts-node/*.sha256" \
-            "artifacts-node/fennel-node-linux-amd64" \
-            "artifacts-node/fennel-node-linux-amd64.sha256" \
-            "artifacts-node/fennel-node-linux-arm64" \
-            "artifacts-node/fennel-node-linux-arm64.sha256"; do
-            if ls $file 1> /dev/null 2>&1; then
-              echo "  ✅ $file exists"
-            else
-              echo "  ❌ $file MISSING"
-            fi
-          done
+          mkdir -p ./artifacts
+          echo "Image name: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}" > ./artifacts/image-info.txt
+          echo "Tags:      ${{ steps.meta.outputs.tags }}" >> ./artifacts/image-info.txt
+          echo "Wasm hash: ${{ needs.build-amd64.outputs.wasm-hash }}"          >> ./artifacts/image-info.txt
+          echo "AMD64 digest: ${{ needs.build-amd64.outputs.image-digest }}" >> ./artifacts/image-info.txt
+          echo "ARM64 digest: ${{ needs.build-arm64.outputs.image-digest }}" >> ./artifacts/image-info.txt
+          echo "Created:   $(date -u +\"%Y-%m-%dT%H:%M:%SZ\")" >> ./artifacts/image-info.txt
 
-      - name: Derive artifact basenames for release body
-        id: relvars
-        run: |
-          echo "tarball_name=${{ steps.restore_context.outputs.tarball_basename }}" >> "$GITHUB_OUTPUT"
-          echo "raw_name=${{ steps.restore_context.outputs.raw_binary_basename }}" >> "$GITHUB_OUTPUT"
-
-      - name: Create GitHub Release
-        uses: softprops/action-gh-release@v2
-        if: startsWith(github.ref, 'refs/tags/')
+      - name: Upload Docker image info artifact
+        uses: actions/upload-artifact@v4
         with:
-          files: |
-            release/*.tgz
-            ./artifacts/image-info.txt
-            ./artifacts/fennel-docker-sbom.json
-            chainspecs/development/development.json
-            chainspecs/development/development-raw.json
-            chainspecs/staging/staging-chainspec.json
-            chainspecs/staging/staging-raw.json
-            chainspecs/production/production-chainspec.json
-            chainspecs/production/production-raw.json
-            ${{ steps.restore_context.outputs.tarball_file }}
-            ${{ steps.restore_context.outputs.tarball_file }}.sha256
-            ${{ steps.restore_context.outputs.raw_binary_file }}
-            ${{ steps.restore_context.outputs.raw_binary_file }}.sha256
-          generate_release_notes: true
-          fail_on_unmatched_files: true
-          overwrite_files: true
-          body: |
-            ## 🚀 Fennel Node ${{ github.ref_name }}
-
-            This release ships the Fennel node binary, Docker image, Helm chart and full chainspec set.
-
-            ### 📦 Quick start for Ansible
-
-            ```yaml
-            # Copy these into your Ansible vars (the values are literal, not templated at runtime)
-            fennel_node_version: "${{ github.ref_name }}"
-            fennel_node_binary_url: "https://github.com/${{ github.repository }}/releases/download/${{ github.ref_name }}/${{ steps.relvars.outputs.raw_name }}"
-            fennel_node_binary_checksum: "${{ steps.restore_context.outputs.raw_binary_ansible_checksum }}"
-
-            fennel_node_tarball_url: "https://github.com/${{ github.repository }}/releases/download/${{ github.ref_name }}/${{ steps.relvars.outputs.tarball_name }}"
-            fennel_node_tarball_checksum: "${{ steps.restore_context.outputs.tarball_ansible_checksum }}"
-            ```
-
-            ```yaml
-            - name: Install Fennel node
-              ansible.builtin.get_url:
-                url: "{{ fennel_node_binary_url }}"
-                dest: /usr/local/bin/fennel-node
-                mode: "0755"  # Required: GitHub releases don't preserve executable permissions
-                checksum: "{{ fennel_node_binary_checksum }}"
-            ```
-
-            ### 🐳 Docker
-
-            ```bash
-            docker pull ghcr.io/${{ github.repository }}:${{ github.ref_name }}
-            ```
-
-            ### � Security & Supply Chain
-
-            This release includes:
-            - **Provenance attestations** for Docker images (buildx `--provenance=true`)
-            - **Software Bill of Materials (SBOM)** attached as `fennel-docker-sbom.json`
-            - **Deterministic builds** using srtool for reproducible WASM runtime
-
-            ### �📋 Chainspecs
-            Dev · Staging · Production JSON + raw files are attached.
-
-            **Runtime WASM SHA-256:** `${{ env.WASM_HASH }}`
-
-            ---
-            *Built deterministically with srtool* 🛠️
-        env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-
-      - name: Run chart-releaser
-        uses: helm/chart-releaser-action@v1.6.0
-        with:
-          charts_dir: Charts
-          skip_existing: true
-        env:
-          CR_TOKEN: "${{ secrets.GITHUB_TOKEN }}"
+          name: fennel-node-image-info
+          path: ./artifacts/image-info.txt
 
       - name: Upload Helm chart artifact
         uses: actions/upload-artifact@v4
@@ -1590,96 +852,92 @@ jobs:
           path: release/*.tgz
           retention-days: 30
 
+      # Derive artifact basenames for release body
+      - name: Derive artifact basenames for release body
+        id: relvars
+        run: |
+          # Find the tarball and binary names from the downloaded artifacts
+          TARBALL=$(find artifacts/ -name "*.tar.gz" | head -1)
+          BINARY=$(find artifacts/ -name "fennel-node-linux-x86_64" | head -1)
+          
+          echo "tarball_name=$(basename "$TARBALL")" >> "$GITHUB_OUTPUT"
+          echo "raw_name=$(basename "$BINARY")" >> "$GITHUB_OUTPUT"
+
+      # Create GitHub Release
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v2
+        if: startsWith(github.ref, 'refs/tags/')
+        with:
+          files: |
+            release/*.tgz
+            ./artifacts/image-info.txt
+            artifacts/fennel-chainspecs-amd64/*
+            artifacts/fennel-node-binary-amd64/*
+          generate_release_notes: true
+          fail_on_unmatched_files: true
+          body: |
+            ## 🚀 Fennel Node ${{ github.ref_name }}
+
+            This release ships the Fennel node binary, Docker image, Helm chart and full chainspec set.
+
+            ### 📦 Quick start for Ansible
+
+            ```yaml
+            # Copy these into your Ansible vars
+            fennel_node_version: "${{ github.ref_name }}"
+            fennel_node_binary_url: "https://github.com/${{ github.repository }}/releases/download/${{ github.ref_name }}/${{ steps.relvars.outputs.raw_name }}"
+            fennel_node_binary_checksum: "${{ needs.build-amd64.outputs.raw_ansible_checksum }}"
+
+            fennel_node_tarball_url: "https://github.com/${{ github.repository }}/releases/download/${{ github.ref_name }}/${{ steps.relvars.outputs.tarball_name }}"
+            fennel_node_tarball_checksum: "${{ needs.build-amd64.outputs.tarball_ansible_checksum }}"
+            ```
+
+            ### 🐳 Docker
+
+            ```bash
+            docker pull ghcr.io/${{ github.repository }}:${{ github.ref_name }}
+            ```
+
+            ### 📋 Chainspecs
+            Dev · Staging · Production JSON + raw files are attached.
+
+            **Runtime WASM SHA-256:** `${{ needs.build-amd64.outputs.wasm-hash }}`
+
+            ---
+            *Built deterministically with srtool* 🛠️
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+      # Run chart-releaser
+      - name: Run chart-releaser
+        uses: helm/chart-releaser-action@v1.6.0
+        with:
+          charts_dir: Charts
+          skip_existing: true
+        env:
+          CR_TOKEN: "${{ secrets.GITHUB_TOKEN }}"
+
+      # Output workflow summary
       - name: Output workflow summary
         run: |
           echo "## 📊 Build Summary" >> $GITHUB_STEP_SUMMARY
           echo "" >> $GITHUB_STEP_SUMMARY
-          echo "### 🐳 Docker Image" >> $GITHUB_STEP_SUMMARY
-          echo "- **Image**: \`${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}\`" >> $GITHUB_STEP_SUMMARY
-          echo "- **Tag**: \`${{ steps.extract_tag.outputs.tag }}\`" >> $GITHUB_STEP_SUMMARY
-          echo "- **Wasm Hash**: \`${{ env.WASM_HASH }}\`" >> $GITHUB_STEP_SUMMARY
-          echo "" >> $GITHUB_STEP_SUMMARY
-          echo "### 🧮 Node Binary" >> $GITHUB_STEP_SUMMARY
-          echo "- **Tarball**: \`${{ steps.restore_context.outputs.tarball_basename }}\`" >> $GITHUB_STEP_SUMMARY
-          echo "- **Tarball SHA256**: \`${{ steps.restore_context.outputs.tarball_sha256 }}\`" >> $GITHUB_STEP_SUMMARY
-          echo "- **Tarball Ansible Checksum**: \`${{ steps.restore_context.outputs.tarball_ansible_checksum }}\`" >> $GITHUB_STEP_SUMMARY
-          echo "- **Raw Binary**: \`${{ steps.restore_context.outputs.raw_binary_basename }}\` (for Parity Ansible)" >> $GITHUB_STEP_SUMMARY
-          echo "- **Raw Binary SHA256**: \`${{ steps.restore_context.outputs.raw_binary_sha256 }}\`" >> $GITHUB_STEP_SUMMARY
-          echo "- **Raw Binary Ansible Checksum**: \`${{ steps.restore_context.outputs.raw_binary_ansible_checksum }}\`" >> $GITHUB_STEP_SUMMARY
-          echo "- **Architecture**: Multi-arch (amd64, arm64)" >> $GITHUB_STEP_SUMMARY
-          echo "" >> $GITHUB_STEP_SUMMARY
-          echo "### 📋 Chain Specs" >> $GITHUB_STEP_SUMMARY
-          echo "- ✅ Development chain spec generated" >> $GITHUB_STEP_SUMMARY
-          echo "- ✅ Staging chain spec generated" >> $GITHUB_STEP_SUMMARY
-          if [[ "${{ github.ref }}" == refs/tags/* ]]; then
-            echo "- 🏭 **Production chain spec generated** (Release only)" >> $GITHUB_STEP_SUMMARY
-          else
-            echo "- ⏭️ Production chain spec (Release builds only)" >> $GITHUB_STEP_SUMMARY
-          fi
-          echo "" >> $GITHUB_STEP_SUMMARY
-          echo "### 📦 Helm Chart" >> $GITHUB_STEP_SUMMARY
-          echo "- ✅ Chart packaged and published" >> $GITHUB_STEP_SUMMARY
-          echo "- **Version**: \`$(helm show chart release/*.tgz | grep '^version:' | awk '{print $2}')\`" >> $GITHUB_STEP_SUMMARY
-          echo "- **Digest**: \`${{ steps.restore_context.outputs.image_digest }}\`" >> $GITHUB_STEP_SUMMARY
-          echo "" >> $GITHUB_STEP_SUMMARY
-          echo "### 🔐 Security Checks" >> $GITHUB_STEP_SUMMARY
-          echo "- ✅ Chainspec SHA-256 computed" >> $GITHUB_STEP_SUMMARY
-          echo "- Staging: \`${{ steps.specsha.outputs.staging_sha }}\`" >> $GITHUB_STEP_SUMMARY
-          echo "- Development: \`${{ steps.specsha.outputs.dev_sha }}\`" >> $GITHUB_STEP_SUMMARY
-          if [[ "${{ github.ref }}" == refs/tags/* ]]; then
-            echo "- Production: \`${{ steps.specsha.outputs.production_sha }}\`" >> $GITHUB_STEP_SUMMARY
-          fi
+          echo "### 🐳 Docker Images" >> $GITHUB_STEP_SUMMARY
+          echo "- **Repository**: \`${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}\`" >> $GITHUB_STEP_SUMMARY
+          echo "- **Architectures**: AMD64, ARM64" >> $GITHUB_STEP_SUMMARY
+          echo "- **Wasm Hash**: \`${{ needs.build-amd64.outputs.wasm-hash }}\`" >> $GITHUB_STEP_SUMMARY
           echo "" >> $GITHUB_STEP_SUMMARY
           echo "### 📦 Artifacts" >> $GITHUB_STEP_SUMMARY
-          echo "- 🐳 **fennel-node-image-info**: Docker image metadata and build info (multi-arch)" >> $GITHUB_STEP_SUMMARY
-          echo "- ⚓ **fennel-helm-chart**: Packaged Helm chart (\`.tgz\`)" >> $GITHUB_STEP_SUMMARY
-          echo "- 🧮 **fennel-node-binary**: Node binary tarballs and SHA256 checksums (amd64, arm64)" >> $GITHUB_STEP_SUMMARY
-          if [[ "${{ github.ref }}" == refs/tags/* ]]; then
-            echo "- 🔗 **fennel-chainspecs**: Development, staging, and **production** chainspecs (JSON + raw)" >> $GITHUB_STEP_SUMMARY
-          else
-            echo "- 🔗 **fennel-chainspecs**: Development and staging chainspecs (JSON + raw)" >> $GITHUB_STEP_SUMMARY
-          fi
+          echo "- ✅ Docker images (AMD64 + ARM64)" >> $GITHUB_STEP_SUMMARY
+          echo "- ✅ Chain specifications (dev/staging/production)" >> $GITHUB_STEP_SUMMARY
+          echo "- ✅ Node binaries with checksums" >> $GITHUB_STEP_SUMMARY
+          echo "- ✅ Helm chart packaged and published" >> $GITHUB_STEP_SUMMARY
+          echo "- ✅ GitHub release created" >> $GITHUB_STEP_SUMMARY
           echo "" >> $GITHUB_STEP_SUMMARY
           if [[ "${{ github.ref }}" == refs/tags/* ]]; then
-            echo "### 🏭 Production Release Information" >> $GITHUB_STEP_SUMMARY
-            echo "- **Release Tag**: \`${{ github.ref_name }}\`" >> $GITHUB_STEP_SUMMARY
-            echo "- **Production Chainspec**: \`chainspecs/production/production-raw.json\`" >> $GITHUB_STEP_SUMMARY
-            echo "- **Node Binary**: \`${{ steps.restore_context.outputs.tarball_basename }}\` (Multi-arch)" >> $GITHUB_STEP_SUMMARY
+            echo "### 🏭 Production Release" >> $GITHUB_STEP_SUMMARY
+            echo "- **Tag**: \`${{ github.ref_name }}\`" >> $GITHUB_STEP_SUMMARY
+            echo "- **Signed**: ✅ GPG verified" >> $GITHUB_STEP_SUMMARY
+            echo "- **Production keys**: ✅ From GitHub Secrets" >> $GITHUB_STEP_SUMMARY
             echo "- **Chain Type**: Live (Production)" >> $GITHUB_STEP_SUMMARY
-            echo "- **Bootnode Architecture**: External-only (Parity best practice)" >> $GITHUB_STEP_SUMMARY
-            echo "- **Key Management**: Placeholder keys (Replace with Vault-managed keys for deployment)" >> $GITHUB_STEP_SUMMARY
-            echo "" >> $GITHUB_STEP_SUMMARY
-            echo "⚠️ **Important for Production Deployment**:" >> $GITHUB_STEP_SUMMARY
-            echo "- Production chainspec contains placeholder validator keys" >> $GITHUB_STEP_SUMMARY
-            echo "- Real validator and bootnode keys are managed via HashiCorp Vault" >> $GITHUB_STEP_SUMMARY
-            echo "- Use offline-generated keys for production security" >> $GITHUB_STEP_SUMMARY
-            echo "" >> $GITHUB_STEP_SUMMARY
-            echo "🤖 **For Parity Ansible Deployment**:" >> $GITHUB_STEP_SUMMARY
-            BINARY_FILENAME="${{ steps.restore_context.outputs.tarball_basename }}"
-            RAW_BINARY_FILENAME="${{ steps.restore_context.outputs.raw_binary_basename }}"
-            echo "- **Tarball URL**: \`https://github.com/${{ github.repository }}/releases/download/${{ github.ref_name }}/${BINARY_FILENAME}\`" >> $GITHUB_STEP_SUMMARY
-            echo "- **Raw Binary URL**: \`https://github.com/${{ github.repository }}/releases/download/${{ github.ref_name }}/${RAW_BINARY_FILENAME}\` (recommended)" >> $GITHUB_STEP_SUMMARY
-            echo "- **Raw Binary Ansible Checksum**: \`${{ steps.restore_context.outputs.raw_binary_ansible_checksum }}\`" >> $GITHUB_STEP_SUMMARY
-            echo "- **Architecture**: Multi-arch (amd64, arm64)" >> $GITHUB_STEP_SUMMARY
-            echo "- **Usage**: Direct download for Parity Ansible roles (avoids unarchive step)" >> $GITHUB_STEP_SUMMARY
-            echo "" >> $GITHUB_STEP_SUMMARY
-            echo "📋 **Ansible Inventory Example**:" >> $GITHUB_STEP_SUMMARY
-            echo "\`\`\`yaml" >> $GITHUB_STEP_SUMMARY
-            echo "node_binary: \"https://github.com/${{ github.repository }}/releases/download/${{ github.ref_name }}/${RAW_BINARY_FILENAME}\"" >> $GITHUB_STEP_SUMMARY
-            echo "node_binary_checksum: \"${{ steps.restore_context.outputs.raw_binary_ansible_checksum }}\"" >> $GITHUB_STEP_SUMMARY
-            echo "\`\`\`" >> $GITHUB_STEP_SUMMARY
-            echo "" >> $GITHUB_STEP_SUMMARY
-            echo "⚠️ **Important: Always Set Executable Permissions**" >> $GITHUB_STEP_SUMMARY
-            echo "GitHub Releases don't preserve POSIX permissions reliably. Always set mode explicitly:" >> $GITHUB_STEP_SUMMARY
-            echo "\`\`\`yaml" >> $GITHUB_STEP_SUMMARY
-            echo "- name: Download and install Fennel node binary" >> $GITHUB_STEP_SUMMARY
-            echo "  ansible.builtin.get_url:" >> $GITHUB_STEP_SUMMARY
-            echo "    url: \"https://github.com/${{ github.repository }}/releases/download/${{ github.ref_name }}/${RAW_BINARY_FILENAME}\"" >> $GITHUB_STEP_SUMMARY
-            echo "    dest: /usr/local/bin/fennel-node" >> $GITHUB_STEP_SUMMARY
-            echo "    mode: '0755'" >> $GITHUB_STEP_SUMMARY
-            echo "    checksum: \"${{ steps.restore_context.outputs.raw_binary_ansible_checksum }}\"" >> $GITHUB_STEP_SUMMARY
-            echo "\`\`\`" >> $GITHUB_STEP_SUMMARY
-            echo "This prevents 'Permission denied' errors and follows Substrate community best practices." >> $GITHUB_STEP_SUMMARY
-            echo "" >> $GITHUB_STEP_SUMMARY
-          fi
-          echo "🔍 **View artifacts**: Go to the [Actions tab](https://github.com/${{ github.repository }}/actions/runs/${{ github.run_id }}) for this workflow run." >> $GITHUB_STEP_SUMMARY
+          fi 

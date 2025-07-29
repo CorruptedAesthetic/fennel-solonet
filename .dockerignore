@@ -1,1 +1,76 @@
+# Build artifacts and cache directories
 /target/
+target/
+**/target/
+
+# Git repository (can be huge)
+.git/
+.gitignore
+
+# Docker files and build context optimization
+Dockerfile*
+.dockerignore
+docker-compose*.yml
+
+# Documentation and non-essential files
+/docs/
+README.md
+*.md
+CHANGELOG*
+LICENSE*
+CODEOWNERS
+
+# IDE and editor files
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+.DS_Store
+
+# CI/CD files
+.github/
+.yamllint
+rustfmt.toml
+
+# Development scripts and tools
+scripts/
+*.sh
+bin/
+
+# Helm charts and Kubernetes configs (not needed in container)
+Charts/
+kubernetes/
+chainspecs/
+
+# Cargo cache and temporary files
+.cargo/registry/
+.cargo/git/
+**/.cargo/registry/
+**/.cargo/git/
+
+# Runtime artifacts
+runtime/*/target/
+**/wbuild/
+
+# Node.js (if present)
+node_modules/
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+
+# Python cache
+__pycache__/
+*.py[cod]
+*$py.class
+
+# Temporary files
+*.tmp
+*.temp
+*.log
+
+# Development containers
+.devcontainer/
+
+# Test artifacts
+*.profraw
