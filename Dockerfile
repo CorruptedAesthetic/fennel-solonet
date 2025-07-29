@@ -34,17 +34,20 @@ RUN apt update && apt upgrade -y && \
         pkg-config libssl-dev && \
     rm -rf /var/lib/apt/lists/* /tmp/* && apt clean
 
-# Install ARM64 target with explicit debugging and verification
-RUN echo "🔧 Installing ARM64 target (cook-arm64 stage)..." && \
+# Install ARM64 target with explicit debugging and verification (FORCE-REBUILD: 2025-01-29-GITHUB-ACTIONS)
+RUN echo "=== 🔧 FORCE INSTALLING ARM64 TARGET (cook-arm64 stage) ===" && \
+    date && \
     rustup show && \
-    echo "📋 Available targets before:" && \
+    echo "=== 📋 Available targets before ===" && \
     rustup target list --installed && \
-    echo "🎯 Adding aarch64-unknown-linux-gnu target..." && \
+    echo "=== 🎯 Adding aarch64-unknown-linux-gnu target ===" && \
     rustup target add aarch64-unknown-linux-gnu && \
-    echo "✅ Available targets after:" && \
+    echo "=== ✅ Available targets after ===" && \
     rustup target list --installed && \
-    echo "🔍 Verifying target installation..." && \
-    rustup target list --installed | grep aarch64-unknown-linux-gnu || (echo "❌ Target installation failed!" && exit 1)
+    echo "=== 🔍 Verifying target installation ===" && \
+    rustup target list --installed | grep aarch64-unknown-linux-gnu && \
+    echo "=== ✅ ARM64 TARGET SUCCESSFULLY INSTALLED (cook-arm64) ===" || \
+    (echo "=== ❌ ARM64 TARGET INSTALLATION FAILED (cook-arm64) ===" && exit 1)
 
 # Set up cross-compilation environment variables
 ENV CC_aarch64_unknown_linux_gnu="aarch64-linux-gnu-gcc" \
@@ -140,17 +143,20 @@ RUN apt update && apt upgrade -y && \
         pkg-config libssl-dev && \
     rm -rf /var/lib/apt/lists/* /tmp/* && apt clean
 
-# Install ARM64 target with explicit debugging and verification (cache-bust: 2025-01-29-v2)
-RUN echo "🔧 Installing ARM64 target..." && \
+# Install ARM64 target with explicit debugging and verification (FORCE-REBUILD: 2025-01-29-GITHUB-ACTIONS)
+RUN echo "=== 🔧 FORCE INSTALLING ARM64 TARGET ===" && \
+    date && \
     rustup show && \
-    echo "📋 Available targets before:" && \
+    echo "=== 📋 Available targets before ===" && \
     rustup target list --installed && \
-    echo "🎯 Adding aarch64-unknown-linux-gnu target..." && \
+    echo "=== 🎯 Adding aarch64-unknown-linux-gnu target ===" && \
     rustup target add aarch64-unknown-linux-gnu && \
-    echo "✅ Available targets after:" && \
+    echo "=== ✅ Available targets after ===" && \
     rustup target list --installed && \
-    echo "🔍 Verifying target installation..." && \
-    rustup target list --installed | grep aarch64-unknown-linux-gnu || (echo "❌ Target installation failed!" && exit 1)
+    echo "=== 🔍 Verifying target installation ===" && \
+    rustup target list --installed | grep aarch64-unknown-linux-gnu && \
+    echo "=== ✅ ARM64 TARGET SUCCESSFULLY INSTALLED ===" || \
+    (echo "=== ❌ ARM64 TARGET INSTALLATION FAILED ===" && exit 1)
 
 # Set up cross-compilation environment variables
 ENV CC_aarch64_unknown_linux_gnu="aarch64-linux-gnu-gcc" \
