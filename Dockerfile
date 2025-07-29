@@ -1,87 +1,73 @@
 # syntax=docker/dockerfile:1.7
-######################## common base ########################
+######################## unified base (Parity's approach) ########################
 FROM --platform=$BUILDPLATFORM docker.io/paritytech/ci-unified:latest as base
 
 WORKDIR /fennel
 
-# Install cargo-chef and pre-fetch the wasm target once
-RUN cargo install cargo-chef \
-    && rustup target add wasm32-unknown-unknown
+# Install cargo-chef for dependency optimization
+RUN cargo install cargo-chef
 
-# Optimize cargo for space and reduce compilation units
-ENV CARGO_NET_GIT_FETCH_WITH_CLI=true
-ENV CARGO_INCREMENTAL=0
-ENV CARGO_PROFILE_RELEASE_CODEGEN_UNITS=1
-ENV CARGO_PROFILE_RELEASE_LTO=true
+# Install ALL targets upfront (Parity's way - prepare everything once)
+RUN rustup target add wasm32-unknown-unknown && \
+    rustup target add aarch64-unknown-linux-gnu && \
+    echo "✅ All targets installed:" && \
+    rustup target list --installed
 
-# Planner stage - analyze dependencies
-FROM base AS planner
-COPY . .
-RUN cargo chef prepare --recipe-path recipe.json
-
-# Cook dependencies on x86_64 (works for both architectures)
-FROM base AS cook
-COPY --from=planner /fennel/recipe.json recipe.json
-RUN cargo chef cook --release --recipe-path recipe.json
-
-# Cook ARM64 dependencies using ci-unified with cross-compilation setup
-FROM base AS cook-arm64
-
-# Install ARM64 cross-compilation tools
+# Install ARM64 cross-compilation tools upfront (Parity's way)
 RUN apt update && apt upgrade -y && \
-    apt install -y \
+    apt install -y --no-install-recommends \
         g++-aarch64-linux-gnu libc6-dev-arm64-cross \
         pkg-config libssl-dev && \
-    rm -rf /var/lib/apt/lists/* /tmp/* && apt clean
+    rm -rf /var/lib/apt/lists/* /tmp/* && apt clean && \
+    echo "✅ ARM64 cross-compilation tools installed"
 
-# Install ARM64 target with explicit debugging and verification (FORCE-REBUILD: 2025-01-29-GITHUB-ACTIONS)
-RUN echo "=== 🔧 FORCE INSTALLING ARM64 TARGET (cook-arm64 stage) ===" && \
-    date && \
-    rustup show && \
-    echo "=== 📋 Available targets before ===" && \
-    rustup target list --installed && \
-    echo "=== 🎯 Adding aarch64-unknown-linux-gnu target ===" && \
-    rustup target add aarch64-unknown-linux-gnu && \
-    echo "=== ✅ Available targets after ===" && \
-    rustup target list --installed && \
-    echo "=== 🔍 Verifying target installation ===" && \
-    rustup target list --installed | grep aarch64-unknown-linux-gnu && \
-    echo "=== ✅ ARM64 TARGET SUCCESSFULLY INSTALLED (cook-arm64) ===" || \
-    (echo "=== ❌ ARM64 TARGET INSTALLATION FAILED (cook-arm64) ===" && exit 1)
-
-# Set up cross-compilation environment variables
+# Set up ALL cross-compilation environment variables upfront (Parity's way)
 ENV CC_aarch64_unknown_linux_gnu="aarch64-linux-gnu-gcc" \
     CXX_aarch64_unknown_linux_gnu="aarch64-linux-gnu-g++" \
     BINDGEN_EXTRA_CLANG_ARGS="-I/usr/aarch64-linux-gnu/include/" \
     CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_LINKER="aarch64-linux-gnu-gcc" \
     SKIP_WASM_BUILD=1
 
-# Cook ARM64 dependencies
+# Optimize cargo for space and reduce compilation units
+ENV CARGO_NET_GIT_FETCH_WITH_CLI=true \
+    CARGO_INCREMENTAL=0 \
+    CARGO_PROFILE_RELEASE_CODEGEN_UNITS=1 \
+    CARGO_PROFILE_RELEASE_LTO=true
+
+######################## dependency planning ########################
+FROM base AS planner
+COPY . .
+RUN cargo chef prepare --recipe-path recipe.json
+
+######################## cook dependencies (both architectures) ########################
+FROM base AS cook
+COPY --from=planner /fennel/recipe.json recipe.json
+RUN cargo chef cook --release --recipe-path recipe.json
+
+FROM base AS cook-arm64
 COPY --from=planner /fennel/recipe.json recipe.json
 RUN cargo chef cook --release --recipe-path recipe.json --target aarch64-unknown-linux-gnu
 
-# --- New stage: deterministic WASM runtime build using srtool -----------------
+######################## deterministic WASM runtime (srtool) ########################
 FROM docker.io/paritytech/srtool:1.84.1 AS srtool
 
-# The srtool image expects the sources to live in /build
+# The srtool image expects sources in /build
 WORKDIR /build
 
-# Copy the full workspace so that frame pallets & dependencies are available
+# Copy the full workspace for frame pallets & dependencies
 COPY --chown=builder:builder . .
 
-# Tell srtool which crate contains the runtime. Adjust these paths/names if you
-# ever rename the runtime crate or move it to another folder.
+# Configure srtool for the runtime crate
 ENV RUNTIME_DIR=runtime/fennel
 ENV PACKAGE=fennel-node-runtime
 
-# Build the runtime in deterministic mode. The build script lives inside the
-# image under /scripts/build
+# Build deterministic runtime
 RUN /srtool/build
 
-# The compact deterministic wasm will be available below.
+# Export the deterministic wasm path
 ENV DETERMINISTIC_WASM_PATH=target/srtool/release/wbuild/fennel-node-runtime/fennel_node_runtime.compact.wasm
 
-######################## x86_64 builder ####################
+######################## x86_64 builder (uses unified base) ########################
 FROM base AS builder-amd64
 ARG TARGET=x86_64-unknown-linux-gnu
 
@@ -95,27 +81,23 @@ ARG VAL2_GRANDPA_PUB
 ARG VAL2_STASH_SS58
 
 # Export as environment variables for cargo build
-ENV SUDO_SS58=${SUDO_SS58}
-ENV VAL1_AURA_PUB=${VAL1_AURA_PUB}
-ENV VAL1_GRANDPA_PUB=${VAL1_GRANDPA_PUB}
-ENV VAL1_STASH_SS58=${VAL1_STASH_SS58}
-ENV VAL2_AURA_PUB=${VAL2_AURA_PUB}
-ENV VAL2_GRANDPA_PUB=${VAL2_GRANDPA_PUB}
-ENV VAL2_STASH_SS58=${VAL2_STASH_SS58}
+ENV SUDO_SS58=${SUDO_SS58} \
+    VAL1_AURA_PUB=${VAL1_AURA_PUB} \
+    VAL1_GRANDPA_PUB=${VAL1_GRANDPA_PUB} \
+    VAL1_STASH_SS58=${VAL1_STASH_SS58} \
+    VAL2_AURA_PUB=${VAL2_AURA_PUB} \
+    VAL2_GRANDPA_PUB=${VAL2_GRANDPA_PUB} \
+    VAL2_STASH_SS58=${VAL2_STASH_SS58}
 
-RUN rustup target add $TARGET
-
-# cargo-chef is already available from base stage (no need to copy)
+# Copy pre-cooked dependencies and source
 COPY --from=cook /fennel/target target
 COPY --from=planner /fennel/recipe.json recipe.json
-
-# Dependencies are already cooked, skip the cook step
-
-# Now copy the actual source code and build
 COPY . .
+
+# Build x86_64 binary (target already installed in base)
 RUN cargo build --locked --release --target $TARGET
 
-######################## arm64 builder ####################
+######################## ARM64 builder (uses unified base) ########################
 FROM base AS builder-arm64
 
 # Production environment variables (passed from build args)
@@ -128,61 +110,37 @@ ARG VAL2_GRANDPA_PUB
 ARG VAL2_STASH_SS58
 
 # Export as environment variables for cargo build
-ENV SUDO_SS58=${SUDO_SS58}
-ENV VAL1_AURA_PUB=${VAL1_AURA_PUB}
-ENV VAL1_GRANDPA_PUB=${VAL1_GRANDPA_PUB}
-ENV VAL1_STASH_SS58=${VAL1_STASH_SS58}
-ENV VAL2_AURA_PUB=${VAL2_AURA_PUB}
-ENV VAL2_GRANDPA_PUB=${VAL2_GRANDPA_PUB}
-ENV VAL2_STASH_SS58=${VAL2_STASH_SS58}
+ENV SUDO_SS58=${SUDO_SS58} \
+    VAL1_AURA_PUB=${VAL1_AURA_PUB} \
+    VAL1_GRANDPA_PUB=${VAL1_GRANDPA_PUB} \
+    VAL1_STASH_SS58=${VAL1_STASH_SS58} \
+    VAL2_AURA_PUB=${VAL2_AURA_PUB} \
+    VAL2_GRANDPA_PUB=${VAL2_GRANDPA_PUB} \
+    VAL2_STASH_SS58=${VAL2_STASH_SS58}
 
-# Install ARM64 cross-compilation tools (same as cook-arm64 stage)
-RUN apt update && apt upgrade -y && \
-    apt install -y \
-        g++-aarch64-linux-gnu libc6-dev-arm64-cross \
-        pkg-config libssl-dev && \
-    rm -rf /var/lib/apt/lists/* /tmp/* && apt clean
-
-# Install ARM64 target with explicit debugging and verification (FORCE-REBUILD: 2025-01-29-GITHUB-ACTIONS)
-RUN echo "=== 🔧 FORCE INSTALLING ARM64 TARGET ===" && \
-    date && \
-    rustup show && \
-    echo "=== 📋 Available targets before ===" && \
-    rustup target list --installed && \
-    echo "=== 🎯 Adding aarch64-unknown-linux-gnu target ===" && \
-    rustup target add aarch64-unknown-linux-gnu && \
-    echo "=== ✅ Available targets after ===" && \
-    rustup target list --installed && \
-    echo "=== 🔍 Verifying target installation ===" && \
-    rustup target list --installed | grep aarch64-unknown-linux-gnu && \
-    echo "=== ✅ ARM64 TARGET SUCCESSFULLY INSTALLED ===" || \
-    (echo "=== ❌ ARM64 TARGET INSTALLATION FAILED ===" && exit 1)
-
-# Set up cross-compilation environment variables
-ENV CC_aarch64_unknown_linux_gnu="aarch64-linux-gnu-gcc" \
-    CXX_aarch64_unknown_linux_gnu="aarch64-linux-gnu-g++" \
-    BINDGEN_EXTRA_CLANG_ARGS="-I/usr/aarch64-linux-gnu/include/" \
-    CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_LINKER="aarch64-linux-gnu-gcc" \
-    SKIP_WASM_BUILD=1
-
-# Copy pre-cooked ARM64 dependencies for faster builds
+# Copy pre-cooked ARM64 dependencies and source
 COPY --from=cook-arm64 /fennel/target target
 COPY --from=planner /fennel/recipe.json recipe.json
-
-# Copy sources and build with xbuilder's pre-configured environment
 COPY . .
+
+# Verify ARM64 target is available (should be from base stage)
+RUN echo "Verifying ARM64 target availability:" && \
+    rustup target list --installed | grep aarch64-unknown-linux-gnu && \
+    echo "✅ ARM64 target confirmed - building"
+
+# Build ARM64 binary (target and tools already installed in base)
 RUN cargo build --locked --release --target aarch64-unknown-linux-gnu
 
-######################## final stage #######################
+######################## final runtime image ########################
 FROM docker.io/parity/base-bin:latest
 
 ARG TARGETARCH
-# Copy both binaries using the battle-tested Pattern A approach
-# This avoids variable substitution in --from= which Docker doesn't support
+
+# Copy both architecture binaries
 COPY --from=builder-amd64 /fennel/target/x86_64-unknown-linux-gnu/release/fennel-node /tmp/fennel-node-amd64
 COPY --from=builder-arm64 /fennel/target/aarch64-unknown-linux-gnu/release/fennel-node /tmp/fennel-node-arm64
 
-# Select the correct binary at runtime based on TARGETARCH
+# Select correct binary based on target architecture
 RUN if [ "$TARGETARCH" = "amd64" ]; then \
         mv /tmp/fennel-node-amd64 /usr/local/bin/fennel-node; \
     elif [ "$TARGETARCH" = "arm64" ]; then \
@@ -192,29 +150,26 @@ RUN if [ "$TARGETARCH" = "amd64" ]; then \
     fi && \
     chmod +x /usr/local/bin/fennel-node
 
-# Copy the deterministic wasm compiled with srtool (optional but convenient for
-# governance upgrades & CI verification)
+# Copy deterministic wasm for governance upgrades
 COPY --from=srtool /build/runtime/fennel/target/srtool/release/wbuild/fennel-node-runtime/fennel_node_runtime.compact.wasm /usr/local/bin/fennel_node_runtime.compact.wasm
 RUN test -f /usr/local/bin/fennel_node_runtime.compact.wasm
 
 ARG WASM_HASH=unknown
 LABEL io.parity.srtool.wasm-hash=${WASM_HASH}
 
+# Create fennel user and setup permissions
 USER root
 RUN useradd -m -u 1001 -U -s /bin/sh -d /fennel fennel && \
-	mkdir -p /data /fennel/.local/share && \
-	chown -R fennel:fennel /data && \
-	ln -s /data /fennel/.local/share/fennel && \
-# check if executable works in this container
-	/usr/local/bin/fennel-node --version
+    mkdir -p /data /fennel/.local/share && \
+    chown -R fennel:fennel /data && \
+    ln -s /data /fennel/.local/share/fennel && \
+    /usr/local/bin/fennel-node --version
 
 USER fennel
 
+# Expose standard Substrate ports
 EXPOSE 9933 9944 30333 9615
-# Removed ports:
-# - 9930: Removed unless specific reverse-proxy need (ecosystem standard)
-# - 30334: Removed - only needed for relay-within-relay processes
 VOLUME ["/data"]
 
-# Use node binary as entrypoint (Parity standard practice)
+# Use node binary as entrypoint
 ENTRYPOINT ["/usr/local/bin/fennel-node"]
