@@ -1,30 +1,29 @@
 # syntax=docker/dockerfile:1.7
-######################## unified base (Parity's approach) ########################
 FROM --platform=$BUILDPLATFORM docker.io/paritytech/ci-unified:latest as base
 
 WORKDIR /fennel
 
-# Install cargo-chef and targets with explicit toolchain (your proven approach)
-RUN cargo install cargo-chef && \
-    rustup target add wasm32-unknown-unknown --toolchain 1.84.1-x86_64-unknown-linux-gnu && \
-    rustup target add aarch64-unknown-linux-gnu --toolchain 1.84.1-x86_64-unknown-linux-gnu
+# Override default toolchain to match rust-toolchain.toml (Parity's pattern)
+RUN rustup default 1.84.1-x86_64-unknown-linux-gnu
 
-# Install only ARM64-specific cross-compilation tools (ci-unified has the rest)
+# Install cargo-chef and add targets to default toolchain (Parity's approach)
+RUN cargo install cargo-chef && \
+    rustup target add wasm32-unknown-unknown && \
+    rustup target add aarch64-unknown-linux-gnu
+
+# Install ARM64 cross-compilation tools
 RUN apt update && \
     apt install -y --no-install-recommends \
         g++-aarch64-linux-gnu libc6-dev-arm64-cross && \
-    rm -rf /var/lib/apt/lists/* && apt clean && \
-    echo "✅ ARM64 cross-compilation tools installed"
+    rm -rf /var/lib/apt/lists/* && apt clean
 
-# Create Cargo config for cross-compilation (Parity's approach)
+# Create Cargo config for cross-compilation
 RUN mkdir -p /root/.cargo /home/nonroot/.cargo && \
     echo '[target.aarch64-unknown-linux-gnu]' > /root/.cargo/config && \
     echo 'linker = "aarch64-linux-gnu-gcc"' >> /root/.cargo/config && \
-    echo '[target.wasm32-unknown-unknown]' >> /root/.cargo/config && \
-    echo 'linker = "clang-15"' >> /root/.cargo/config && \
     cp /root/.cargo/config /home/nonroot/.cargo/config
 
-# Set up cross-compilation environment variables (Parity's way)
+# Set up cross-compilation environment variables
 ENV CC_aarch64_unknown_linux_gnu="aarch64-linux-gnu-gcc" \
     CXX_aarch64_unknown_linux_gnu="aarch64-linux-gnu-g++" \
     BINDGEN_EXTRA_CLANG_ARGS="-I/usr/aarch64-linux-gnu/include/" \
@@ -37,122 +36,70 @@ ENV CARGO_NET_GIT_FETCH_WITH_CLI=true \
     CARGO_PROFILE_RELEASE_CODEGEN_UNITS=1 \
     CARGO_PROFILE_RELEASE_LTO=true
 
-######################## dependency planning ########################
+# Planner stage - analyze dependencies
 FROM base AS planner
 COPY . .
 RUN cargo chef prepare --recipe-path recipe.json
 
-######################## cook dependencies (both architectures) ########################
+# Cook dependencies for x86_64
 FROM base AS cook
 COPY --from=planner /fennel/recipe.json recipe.json
 RUN cargo chef cook --release --recipe-path recipe.json
 
+# Cook dependencies for ARM64  
 FROM base AS cook-arm64
 COPY --from=planner /fennel/recipe.json recipe.json
-# Targets already installed in base with explicit toolchain
 RUN cargo chef cook --release --recipe-path recipe.json --target aarch64-unknown-linux-gnu
 
-######################## x86_64 builder (uses unified base) ########################
+# Testing stage - run tests before building
+FROM base AS tester
+COPY . .
+RUN cargo test --features=runtime-benchmarks
+
+# --- New stage: deterministic WASM runtime build using srtool -----------------
+FROM docker.io/paritytech/srtool:1.84.1 AS srtool
+
+# The srtool image expects the sources to live in /build
+WORKDIR /build
+
+# Copy the full workspace so that frame pallets & dependencies are available
+COPY --chown=builder:builder . .
+
+# Tell srtool which crate contains the runtime. Adjust these paths/names if you
+# ever rename the runtime crate or move it to another folder.
+ENV RUNTIME_DIR=runtime/fennel
+ENV PACKAGE=fennel-node-runtime
+
+# Build the runtime in deterministic mode. The build script lives inside the
+# image under /scripts/build
+RUN /srtool/build
+
+# The compact deterministic wasm will be available below.
+ENV DETERMINISTIC_WASM_PATH=target/srtool/release/wbuild/fennel-node-runtime/fennel_node_runtime.compact.wasm
+
+# Builder stage - build x86_64 with cached dependencies
 FROM base AS builder-amd64
-ARG TARGET=x86_64-unknown-linux-gnu
-
-# Build arguments for node features and secrets
-ARG BUILD_RUST_LOG
-ARG BUILD_FENNEL_LOG
-ARG SUDO_SS58
-ARG VAL1_AURA_PUB
-ARG VAL1_GRANDPA_PUB
-ARG VAL1_STASH_SS58
-ARG VAL2_AURA_PUB
-ARG VAL2_GRANDPA_PUB
-ARG VAL2_STASH_SS58
-
-# Convert build args to environment variables for cargo build
-ENV BUILD_RUST_LOG=$BUILD_RUST_LOG \
-    BUILD_FENNEL_LOG=$BUILD_FENNEL_LOG \
-    SUDO_SS58=$SUDO_SS58 \
-    VAL1_AURA_PUB=$VAL1_AURA_PUB \
-    VAL1_GRANDPA_PUB=$VAL1_GRANDPA_PUB \
-    VAL1_STASH_SS58=$VAL1_STASH_SS58 \
-    VAL2_AURA_PUB=$VAL2_AURA_PUB \
-    VAL2_GRANDPA_PUB=$VAL2_GRANDPA_PUB \
-    VAL2_STASH_SS58=$VAL2_STASH_SS58
-
-# Copy pre-cooked dependencies and source
+COPY --from=planner /fennel/recipe.json recipe.json
 COPY --from=cook /fennel/target target
-COPY --from=planner /fennel/recipe.json recipe.json
+
+# Now copy the actual source code and build for x86_64
 COPY . .
+RUN cargo build --locked --release
 
-# Build x86_64 binary (target already installed in base)
-RUN cargo build --locked --release --target $TARGET
-
-######################## ARM64 builder (uses unified base) ########################
+# Builder stage - build ARM64 with cached dependencies
 FROM base AS builder-arm64
-
-# Build arguments for node features and secrets  
-ARG BUILD_RUST_LOG
-ARG BUILD_FENNEL_LOG
-ARG SUDO_SS58
-ARG VAL1_AURA_PUB
-ARG VAL1_GRANDPA_PUB
-ARG VAL1_STASH_SS58
-ARG VAL2_AURA_PUB
-ARG VAL2_GRANDPA_PUB
-ARG VAL2_STASH_SS58
-
-# Convert build args to environment variables for cargo build
-ENV BUILD_RUST_LOG=$BUILD_RUST_LOG \
-    BUILD_FENNEL_LOG=$BUILD_FENNEL_LOG \
-    SUDO_SS58=$SUDO_SS58 \
-    VAL1_AURA_PUB=$VAL1_AURA_PUB \
-    VAL1_GRANDPA_PUB=$VAL1_GRANDPA_PUB \
-    VAL1_STASH_SS58=$VAL1_STASH_SS58 \
-    VAL2_AURA_PUB=$VAL2_AURA_PUB \
-    VAL2_GRANDPA_PUB=$VAL2_GRANDPA_PUB \
-    VAL2_STASH_SS58=$VAL2_STASH_SS58
-
-# Copy pre-cooked ARM64 dependencies and source
-COPY --from=cook-arm64 /fennel/target target
 COPY --from=planner /fennel/recipe.json recipe.json
+COPY --from=cook-arm64 /fennel/target target
+
+# Now copy the actual source code and build for ARM64
 COPY . .
-
-# Targets already installed in base with explicit toolchain
-
-# Build ARM64 binary
 RUN cargo build --locked --release --target aarch64-unknown-linux-gnu
 
-######################## deterministic wasm runtime ########################
-FROM docker.io/paritytech/srtool:1.84.1 AS wasm-builder
-
-# Pass all build arguments for WASM runtime inclusion
-ARG BUILD_RUST_LOG
-ARG BUILD_FENNEL_LOG
-ARG SUDO_SS58
-ARG VAL1_AURA_PUB
-ARG VAL1_GRANDPA_PUB
-ARG VAL1_STASH_SS58
-ARG VAL2_AURA_PUB
-ARG VAL2_GRANDPA_PUB
-ARG VAL2_STASH_SS58
-
-ENV BUILD_RUST_LOG=$BUILD_RUST_LOG \
-    BUILD_FENNEL_LOG=$BUILD_FENNEL_LOG \
-    SUDO_SS58=$SUDO_SS58 \
-    VAL1_AURA_PUB=$VAL1_AURA_PUB \
-    VAL1_GRANDPA_PUB=$VAL1_GRANDPA_PUB \
-    VAL1_STASH_SS58=$VAL1_STASH_SS58 \
-    VAL2_AURA_PUB=$VAL2_AURA_PUB \
-    VAL2_GRANDPA_PUB=$VAL2_GRANDPA_PUB \
-    VAL2_STASH_SS58=$VAL2_STASH_SS58
-
-COPY . /build
-RUN build --skip-wasm-api
-
-######################## final runtime ########################
+# Runtime stage - final image with minimal components
 FROM --platform=$TARGETPLATFORM docker.io/parity/base-bin:latest
 
-# Copy the appropriate binary based on target platform
-COPY --from=builder-amd64 /fennel/target/x86_64-unknown-linux-gnu/release/fennel-node /usr/local/bin/fennel-node-amd64
+# Copy both binaries
+COPY --from=builder-amd64 /fennel/target/release/fennel-node /usr/local/bin/fennel-node-amd64
 COPY --from=builder-arm64 /fennel/target/aarch64-unknown-linux-gnu/release/fennel-node /usr/local/bin/fennel-node-arm64
 
 # Create platform-appropriate symlink
@@ -162,4 +109,26 @@ RUN if [ "$TARGETPLATFORM" = "linux/amd64" ]; then \
         ln -s /usr/local/bin/fennel-node-arm64 /usr/local/bin/fennel-node; \
     fi
 
+# Copy the deterministic wasm compiled with srtool (optional but convenient for
+# governance upgrades & CI verification)
+COPY --from=srtool /build/runtime/fennel/target/srtool/release/wbuild/fennel-node-runtime/fennel_node_runtime.compact.wasm /usr/local/bin/fennel_node_runtime.compact.wasm
+RUN test -f /usr/local/bin/fennel_node_runtime.compact.wasm
+
+ARG WASM_HASH=unknown
+LABEL io.parity.srtool.wasm-hash=${WASM_HASH}
+
+USER root
+RUN useradd -m -u 1001 -U -s /bin/sh -d /fennel fennel && \
+	mkdir -p /data /fennel/.local/share && \
+	chown -R fennel:fennel /data && \
+	ln -s /data /fennel/.local/share/fennel && \
+# check if executable works in this container
+	/usr/local/bin/fennel-node --version
+
+USER fennel
+
+EXPOSE 9933 9944 30333 9615
+VOLUME ["/data"]
+
+# Use node binary as entrypoint (Parity standard practice)
 ENTRYPOINT ["/usr/local/bin/fennel-node"]
