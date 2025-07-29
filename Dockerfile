@@ -32,8 +32,19 @@ RUN apt update && apt upgrade -y && \
     apt install -y \
         g++-aarch64-linux-gnu libc6-dev-arm64-cross \
         pkg-config libssl-dev && \
-    rm -rf /var/lib/apt/lists/* /tmp/* && apt clean && \
-    rustup target add aarch64-unknown-linux-gnu
+    rm -rf /var/lib/apt/lists/* /tmp/* && apt clean
+
+# Install ARM64 target with explicit debugging and verification
+RUN echo "🔧 Installing ARM64 target (cook-arm64 stage)..." && \
+    rustup show && \
+    echo "📋 Available targets before:" && \
+    rustup target list --installed && \
+    echo "🎯 Adding aarch64-unknown-linux-gnu target..." && \
+    rustup target add aarch64-unknown-linux-gnu && \
+    echo "✅ Available targets after:" && \
+    rustup target list --installed && \
+    echo "🔍 Verifying target installation..." && \
+    rustup target list --installed | grep aarch64-unknown-linux-gnu || (echo "❌ Target installation failed!" && exit 1)
 
 # Set up cross-compilation environment variables
 ENV CC_aarch64_unknown_linux_gnu="aarch64-linux-gnu-gcc" \
@@ -127,8 +138,19 @@ RUN apt update && apt upgrade -y && \
     apt install -y \
         g++-aarch64-linux-gnu libc6-dev-arm64-cross \
         pkg-config libssl-dev && \
-    rm -rf /var/lib/apt/lists/* /tmp/* && apt clean && \
-    rustup target add aarch64-unknown-linux-gnu
+    rm -rf /var/lib/apt/lists/* /tmp/* && apt clean
+
+# Install ARM64 target with explicit debugging and verification
+RUN echo "🔧 Installing ARM64 target..." && \
+    rustup show && \
+    echo "📋 Available targets before:" && \
+    rustup target list --installed && \
+    echo "🎯 Adding aarch64-unknown-linux-gnu target..." && \
+    rustup target add aarch64-unknown-linux-gnu && \
+    echo "✅ Available targets after:" && \
+    rustup target list --installed && \
+    echo "🔍 Verifying target installation..." && \
+    rustup target list --installed | grep aarch64-unknown-linux-gnu || (echo "❌ Target installation failed!" && exit 1)
 
 # Set up cross-compilation environment variables
 ENV CC_aarch64_unknown_linux_gnu="aarch64-linux-gnu-gcc" \
