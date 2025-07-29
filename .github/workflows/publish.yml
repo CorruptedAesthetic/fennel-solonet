@@ -147,24 +147,46 @@ jobs:
           set -euo pipefail
           echo "🔐 Setting up production environment variables from GitHub Secrets..."
           
-          # Export for subsequent steps
-          echo "SUDO_SS58=$PROD_SUDO_SS58" >> $GITHUB_ENV
-          echo "VAL1_AURA_PUB=$PROD_VAL1_AURA_PUB" >> $GITHUB_ENV
-          echo "VAL1_GRANDPA_PUB=$PROD_VAL1_GRANDPA_PUB" >> $GITHUB_ENV
-          echo "VAL1_STASH_SS58=$PROD_VAL1_STASH_SS58" >> $GITHUB_ENV
-          echo "VAL2_AURA_PUB=$PROD_VAL2_AURA_PUB" >> $GITHUB_ENV
-          echo "VAL2_GRANDPA_PUB=$PROD_VAL2_GRANDPA_PUB" >> $GITHUB_ENV
-          echo "VAL2_STASH_SS58=$PROD_VAL2_STASH_SS58" >> $GITHUB_ENV
-          
-          # Verify all production variables are set
-          for var in SUDO_SS58 VAL1_AURA_PUB VAL1_GRANDPA_PUB VAL1_STASH_SS58 VAL2_AURA_PUB VAL2_GRANDPA_PUB VAL2_STASH_SS58; do
-            if [ -z "${!var:-}" ]; then
-              echo "❌ ERROR: Production variable $var is empty!"
-              exit 1
-            fi
-          done
-          
-          echo "✅ All production environment variables validated"
+          # For production releases, use real keys from GitHub Secrets
+          if [[ "${GITHUB_REF}" == refs/tags/* ]]; then
+            echo "🏭 Production release detected - exporting production keys from GitHub Secrets"
+            
+            # Export production keys from GitHub Secrets (now available as env vars)
+            export SUDO_SS58="${PROD_SUDO_SS58}"
+            export VAL1_AURA_PUB="${PROD_VAL1_AURA_PUB}"
+            export VAL1_GRANDPA_PUB="${PROD_VAL1_GRANDPA_PUB}"
+            export VAL1_STASH_SS58="${PROD_VAL1_STASH_SS58}"
+            export VAL2_AURA_PUB="${PROD_VAL2_AURA_PUB}"
+            export VAL2_GRANDPA_PUB="${PROD_VAL2_GRANDPA_PUB}"
+            export VAL2_STASH_SS58="${PROD_VAL2_STASH_SS58}"
+            
+            # Verify all production variables are set (prevent empty values)
+            for var in SUDO_SS58 VAL1_AURA_PUB VAL1_GRANDPA_PUB VAL1_STASH_SS58 VAL2_AURA_PUB VAL2_GRANDPA_PUB VAL2_STASH_SS58; do
+              if [ -z "${!var:-}" ]; then
+                echo "❌ ERROR: Production variable $var is empty or missing from GitHub Secrets!"
+                echo "🔧 Add PROD_* secrets to GitHub repository settings"
+                echo "💡 Use extract-github-secrets.sh script to get the required values"
+                exit 1
+              fi
+            done
+            
+            echo "✅ All 7 production environment variables exported from GitHub Secrets and validated"
+            echo "🔒 Using production public keys from GitHub Secrets (private keys remain secure in Vault)"
+            
+            # Export for subsequent steps
+            echo "SUDO_SS58=$SUDO_SS58" >> $GITHUB_ENV
+            echo "VAL1_AURA_PUB=$VAL1_AURA_PUB" >> $GITHUB_ENV
+            echo "VAL1_GRANDPA_PUB=$VAL1_GRANDPA_PUB" >> $GITHUB_ENV
+            echo "VAL1_STASH_SS58=$VAL1_STASH_SS58" >> $GITHUB_ENV
+            echo "VAL2_AURA_PUB=$VAL2_AURA_PUB" >> $GITHUB_ENV
+            echo "VAL2_GRANDPA_PUB=$VAL2_GRANDPA_PUB" >> $GITHUB_ENV
+            echo "VAL2_STASH_SS58=$VAL2_STASH_SS58" >> $GITHUB_ENV
+          else
+            echo "🧪 Development/staging build - production variables not required"
+            echo "📋 Development/staging presets use Alice/Bob hardcoded keys from sp_keyring"
+            echo "⚠️  Production environment variables will NOT be set for non-release builds"
+            echo "🛡️  This is intentional - development uses different preset logic"
+          fi
 
       # Build runtime with srtool
       - name: Build runtime with srtool & extract Wasm hash
