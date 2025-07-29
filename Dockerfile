@@ -1,27 +1,34 @@
 # syntax=docker/dockerfile:1.7
 ######################## unified base (Parity's approach) ########################
-FROM --platform=$BUILDPLATFORM docker.io/paritytech/ci-unified:latest as base
+FROM --platform=$BUILDPLATFORM docker.io/paritytech/ci-unified:bullseye-1.88.0 as base
 
 WORKDIR /fennel
 
 # Install cargo-chef for dependency optimization
 RUN cargo install cargo-chef
 
-# Install ALL targets upfront (Parity's way - prepare everything once)
+# Install ALL targets upfront (True Parity approach - single comprehensive installation)
 RUN rustup target add wasm32-unknown-unknown && \
     rustup target add aarch64-unknown-linux-gnu && \
-    echo "✅ All targets installed:" && \
+    echo "✅ All targets installed" && \
     rustup target list --installed
 
-# Install ARM64 cross-compilation tools upfront (Parity's way)
-RUN apt update && apt upgrade -y && \
+# Install only ARM64-specific cross-compilation tools (ci-unified has the rest)
+RUN apt update && \
     apt install -y --no-install-recommends \
-        g++-aarch64-linux-gnu libc6-dev-arm64-cross \
-        pkg-config libssl-dev && \
-    rm -rf /var/lib/apt/lists/* /tmp/* && apt clean && \
+        g++-aarch64-linux-gnu libc6-dev-arm64-cross && \
+    rm -rf /var/lib/apt/lists/* && apt clean && \
     echo "✅ ARM64 cross-compilation tools installed"
 
-# Set up ALL cross-compilation environment variables upfront (Parity's way)
+# Create Cargo config for cross-compilation (Parity's approach)
+RUN mkdir -p /root/.cargo /home/nonroot/.cargo && \
+    echo '[target.aarch64-unknown-linux-gnu]' > /root/.cargo/config && \
+    echo 'linker = "aarch64-linux-gnu-gcc"' >> /root/.cargo/config && \
+    echo '[target.wasm32-unknown-unknown]' >> /root/.cargo/config && \
+    echo 'linker = "clang-15"' >> /root/.cargo/config && \
+    cp /root/.cargo/config /home/nonroot/.cargo/config
+
+# Set up cross-compilation environment variables (Parity's way)
 ENV CC_aarch64_unknown_linux_gnu="aarch64-linux-gnu-gcc" \
     CXX_aarch64_unknown_linux_gnu="aarch64-linux-gnu-g++" \
     BINDGEN_EXTRA_CLANG_ARGS="-I/usr/aarch64-linux-gnu/include/" \
@@ -46,6 +53,9 @@ RUN cargo chef cook --release --recipe-path recipe.json
 
 FROM base AS cook-arm64
 COPY --from=planner /fennel/recipe.json recipe.json
+
+# Target already installed in base stage
+
 RUN cargo chef cook --release --recipe-path recipe.json --target aarch64-unknown-linux-gnu
 
 ######################## deterministic WASM runtime (srtool) ########################
@@ -123,12 +133,13 @@ COPY --from=cook-arm64 /fennel/target target
 COPY --from=planner /fennel/recipe.json recipe.json
 COPY . .
 
-# Verify ARM64 target is available (should be from base stage)
-RUN echo "Verifying ARM64 target availability:" && \
+# Verify ARM64 target from base stage
+RUN echo "Verifying ARM64 target from base stage:" && \
+    rustup target list --installed && \
     rustup target list --installed | grep aarch64-unknown-linux-gnu && \
-    echo "✅ ARM64 target confirmed - building"
+    echo "✅ ARM64 target confirmed - ready to build"
 
-# Build ARM64 binary (target and tools already installed in base)
+# Build ARM64 binary
 RUN cargo build --locked --release --target aarch64-unknown-linux-gnu
 
 ######################## final runtime image ########################
