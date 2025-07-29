@@ -140,7 +140,7 @@ RUN apt update && apt upgrade -y && \
         pkg-config libssl-dev && \
     rm -rf /var/lib/apt/lists/* /tmp/* && apt clean
 
-# Install ARM64 target with explicit debugging and verification
+# Install ARM64 target with explicit debugging and verification (cache-bust: 2025-01-29-v2)
 RUN echo "🔧 Installing ARM64 target..." && \
     rustup show && \
     echo "📋 Available targets before:" && \
